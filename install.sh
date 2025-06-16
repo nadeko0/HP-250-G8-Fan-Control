@@ -131,6 +131,8 @@ ECIO=/sys/kernel/debug/ec/ec0/io
 LOG_FILE="/var/log/hp-thermal.log"
 STATE_FILE="/tmp/hp-thermal-state"
 TEMP_THRESHOLD=60
+EMERGENCY_COOLING_TEMP=90
+COOLING_RECOVERY_TEMP=85
 EMERGENCY_TEMP=95
 CHECK_INTERVAL=3
 HYSTERESIS=3
@@ -141,6 +143,8 @@ write_ec() { echo -n -e "$(printf '\x%02x' $2)" | dd of="$ECIO" bs=1 seek=$1 cou
 set_manual() { write_ec 21 1; }
 set_auto() { write_ec 21 0; }
 set_fan_off() { write_ec 25 0; }
+set_fan_speed() { write_ec 25 $1; }
+set_max_speed() { write_ec 25 45; }
 get_rpm() { read_ec 17; }
 
 log_msg() {
@@ -171,6 +175,33 @@ emergency_auto() {
         set_auto
     fi
     log_msg "INFO" "AUTO mode restored. Mode=$(read_ec 21)"
+}
+
+emergency_cooling() {
+    log_msg "EMERGENCY" "Critical temperature! Starting emergency cooling at max speed"
+    set_manual
+    sleep 0.5
+    set_max_speed
+    log_msg "INFO" "Max cooling for 5 seconds..."
+    
+    for i in {1..5}; do
+        local temp=$(get_temperature)
+        local rpm=$(get_rpm)
+        log_msg "COOLING" "[$i/5] Temp: ${temp}°C | RPM: $rpm"
+        sleep 1
+    done
+    
+    local temp=$(get_temperature)
+    log_msg "INFO" "Emergency cooling complete. Temperature: ${temp}°C"
+    
+    if [ $temp -lt $COOLING_RECOVERY_TEMP ]; then
+        log_msg "INFO" "Temperature below ${COOLING_RECOVERY_TEMP}°C, switching to AUTO mode"
+        set_auto
+        return 0
+    else
+        log_msg "WARN" "Temperature still high (${temp}°C), keeping max cooling"
+        return 1
+    fi
 }
 
 check_ec() {
@@ -227,6 +258,17 @@ main_loop() {
             set_state "emergency"
             sleep $CHECK_INTERVAL
             continue
+        elif [ $temp -gt $EMERGENCY_COOLING_TEMP ]; then
+            log_msg "EMERGENCY" "High temperature ${temp}°C! Starting emergency cooling"
+            if emergency_cooling; then
+                current_state="active"
+                set_state "$current_state"
+            else
+                current_state="emergency_cooling"
+                set_state "$current_state"
+            fi
+            sleep $CHECK_INTERVAL
+            continue
         fi
         
         case "$current_state" in
@@ -259,6 +301,19 @@ main_loop() {
                 if [ $temp -lt $((EMERGENCY_TEMP - 10)) ]; then
                     log_msg "INFO" "Exiting emergency mode, temperature ${temp}°C"
                     current_state="active"
+                    set_state "$current_state"
+                fi
+                ;;
+            "emergency_cooling")
+                if [ $temp -lt $COOLING_RECOVERY_TEMP ]; then
+                    log_msg "INFO" "Emergency cooling successful, temperature ${temp}°C"
+                    set_auto
+                    current_state="active"
+                    set_state "$current_state"
+                elif [ $temp -gt $EMERGENCY_TEMP ]; then
+                    log_msg "EMERGENCY" "Temperature still critical! Switching to emergency AUTO"
+                    emergency_auto
+                    current_state="emergency"
                     set_state "$current_state"
                 fi
                 ;;
