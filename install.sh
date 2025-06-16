@@ -228,6 +228,8 @@ send_notification() {
     local cooldown_key=$5
     local cooldown_time=${6:-300}  # 5 minutes default cooldown
     
+    log_msg "DEBUG" "Attempting to send notification: $title (cooldown: ${cooldown_time}s)"
+    
     # Check cooldown to avoid spam
     local cooldown_file="${NOTIFICATION_COOLDOWN_FILE}-${cooldown_key}"
     if [ -f "$cooldown_file" ]; then
@@ -235,6 +237,7 @@ send_notification() {
         local current_time=$(date +%s)
         local elapsed=$((current_time - last_notif))
         if [ $elapsed -lt $cooldown_time ]; then
+            log_msg "DEBUG" "Notification skipped (cooldown: ${elapsed}/${cooldown_time}s)"
             return 0  # Skip notification (still in cooldown)
         fi
     fi
@@ -244,36 +247,47 @@ send_notification() {
     local target_user=""
     
     # Method 1: Check who's logged in with a display (X11)
+    log_msg "DEBUG" "Checking who command for active display..."
     for line in $(who | grep "([:]0[)]"); do
         target_user=$(echo "$line" | awk '{print $1}')
         user_display=":0"
+        log_msg "DEBUG" "Found user via who: $target_user"
         break
     done
     
     # Method 2: Check active sessions via loginctl
     if [ -z "$target_user" ]; then
+        log_msg "DEBUG" "Checking loginctl sessions..."
         target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
         user_display=":0"
+        [ -n "$target_user" ] && log_msg "DEBUG" "Found user via loginctl: $target_user"
     fi
     
-    # Method 3: Check WAYLAND_DISPLAY for Wayland sessions
+    # Method 3: Check processes for desktop environments
     if [ -z "$target_user" ]; then
+        log_msg "DEBUG" "Checking desktop environment processes..."
         for user in $(ls /home 2>/dev/null); do
-            if [ -n "$(pgrep -u "$user" "kwin_wayland\|gnome-shell\|sway")" ]; then
+            if [ -n "$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel")" ]; then
                 target_user="$user"
-                user_display="wayland-0"
+                user_display=":0"
+                log_msg "DEBUG" "Found user via desktop processes: $target_user"
                 break
             fi
         done
     fi
     
-    # Method 4: Fallback to first user with active X session
+    # Method 4: Check XDG_RUNTIME_DIR for active sessions
     if [ -z "$target_user" ]; then
-        for user in $(ls /home 2>/dev/null); do
-            if [ -n "$(pgrep -u "$user" Xorg)" ]; then
-                target_user="$user"
-                user_display=":0"
-                break
+        log_msg "DEBUG" "Checking runtime directories..."
+        for runtime_dir in /run/user/*/; do
+            if [ -d "$runtime_dir" ]; then
+                local uid=$(basename "$runtime_dir")
+                target_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+                if [ -n "$target_user" ] && [ "$target_user" != "root" ]; then
+                    user_display=":0"
+                    log_msg "DEBUG" "Found user via runtime dir: $target_user (uid: $uid)"
+                    break
+                fi
             fi
         done
     fi
@@ -282,49 +296,79 @@ send_notification() {
     if [ -z "$target_user" ]; then
         target_user=$(ls /home 2>/dev/null | head -1)
         user_display=":0"
+        [ -n "$target_user" ] && log_msg "DEBUG" "Found user via fallback: $target_user"
     fi
     
     if [ -n "$target_user" ]; then
         local notification_sent=false
+        local user_uid=$(id -u "$target_user" 2>/dev/null)
+        
+        log_msg "DEBUG" "Attempting to send notification to user: $target_user (uid: $user_uid)"
         
         # Try KDE notifications first (kdialog)
         if command -v kdialog &> /dev/null; then
-            sudo -u "$target_user" DISPLAY="$user_display" kdialog \
-                --title "HP Thermal Control" \
-                --passivepopup "$title\n\n$message" 8 2>/dev/null && notification_sent=true
+            log_msg "DEBUG" "Trying kdialog notification..."
+            sudo -u "$target_user" DISPLAY="$user_display" \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                kdialog --title "HP Thermal Control" \
+                --passivepopup "$title\n\n$message" 8 2>/dev/null && {
+                notification_sent=true
+                log_msg "DEBUG" "kdialog notification successful"
+            } || {
+                log_msg "DEBUG" "kdialog notification failed"
+            }
         fi
         
         # Try notify-send if kdialog failed
         if [ "$notification_sent" = false ] && command -v notify-send &> /dev/null; then
+            log_msg "DEBUG" "Trying notify-send notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$(id -u "$target_user")" \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
                 notify-send \
                 --urgency="$urgency" \
                 --icon="$icon" \
                 --app-name="HP Thermal Control" \
                 --expire-time=8000 \
                 "$title" \
-                "$message" 2>/dev/null && notification_sent=true
-        fi
-        
-        # Try zenity as fallback
-        if [ "$notification_sent" = false ] && command -v zenity &> /dev/null; then
-            sudo -u "$target_user" DISPLAY="$user_display" zenity \
-                --notification \
-                --text="$title: $message" \
-                --timeout=8 2>/dev/null && notification_sent=true
+                "$message" 2>/dev/null && {
+                notification_sent=true
+                log_msg "DEBUG" "notify-send notification successful"
+            } || {
+                log_msg "DEBUG" "notify-send notification failed"
+            }
         fi
         
         # Try direct KDE notification via dbus
         if [ "$notification_sent" = false ]; then
+            log_msg "DEBUG" "Trying dbus notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$(id -u "$target_user")" \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
                 dbus-send --session --dest=org.freedesktop.Notifications \
                 /org/freedesktop/Notifications \
                 org.freedesktop.Notifications.Notify \
                 string:"HP Thermal Control" uint32:0 string:"$icon" \
                 string:"$title" string:"$message" \
-                array:string: dict:string,variant: int32:8000 2>/dev/null && notification_sent=true
+                array:string: dict:string,variant: int32:8000 2>/dev/null && {
+                notification_sent=true
+                log_msg "DEBUG" "dbus notification successful"
+            } || {
+                log_msg "DEBUG" "dbus notification failed"
+            }
+        fi
+        
+        # Try zenity as fallback
+        if [ "$notification_sent" = false ] && command -v zenity &> /dev/null; then
+            log_msg "DEBUG" "Trying zenity notification..."
+            sudo -u "$target_user" DISPLAY="$user_display" \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                zenity --notification \
+                --text="$title: $message" \
+                --timeout=8 2>/dev/null && {
+                notification_sent=true
+                log_msg "DEBUG" "zenity notification successful"
+            } || {
+                log_msg "DEBUG" "zenity notification failed"
+            }
         fi
         
         if [ "$notification_sent" = true ]; then
@@ -332,7 +376,7 @@ send_notification() {
             echo "$(date +%s)" > "$cooldown_file"
             log_msg "NOTIF" "Sent notification to $target_user: $title"
         else
-            log_msg "WARN" "Failed to send notification to $target_user"
+            log_msg "WARN" "Failed to send notification to $target_user - all methods failed"
         fi
     else
         log_msg "WARN" "Could not send notification - no active user found"
@@ -545,6 +589,17 @@ main_loop() {
             continue
         fi
         
+        # Additional temperature alerts (independent of state machine)
+        if [ $temp -gt 95 ] && [ "$current_state" != "cooling_down" ]; then
+            log_msg "ALERT" "High temperature detected: ${temp}°C"
+            send_notification "critical" \
+                "🌡️ High Temperature Warning" \
+                "CPU temperature: ${temp}°C\nThermal management active." \
+                "dialog-warning" \
+                "high_temp_alert" \
+                120  # 2 minute cooldown for temperature alerts
+        fi
+        
         if [ $temp -gt $CRITICAL_EMERGENCY_TEMP ]; then
             log_msg "CRITICAL" "CRITICAL temperature ${temp}°C! Emergency AUTO enable"
             emergency_auto
@@ -702,8 +757,18 @@ case "$1" in
             echo "Active notification cooldowns: $notif_files"
         fi
         ;;
+    "test-notification")
+        log_msg "INFO" "Testing desktop notification..."
+        temp=$(get_temperature)
+        send_notification "normal" \
+            "🧪 HP Thermal Test" \
+            "Test notification from HP Thermal Control\nCurrent temperature: ${temp}°C" \
+            "dialog-information" \
+            "test_notification" \
+            0  # No cooldown for test
+        ;;
     "auto") emergency_auto ;;
-    *) echo "Usage: $0 {start|stop|status|auto}"; exit 1 ;;
+    *) echo "Usage: $0 {start|stop|status|auto|test-notification}"; exit 1 ;;
 esac
 THERMAL_EOF
 
@@ -824,6 +889,10 @@ main() {
             echo "  sudo systemctl enable hp-thermal    # Enable autostart"
             echo "  sudo systemctl status hp-thermal    # Check status"
             echo "  sudo journalctl -u hp-thermal -f    # View logs"
+            echo
+            echo "Service commands:"
+            echo "  sudo /usr/local/bin/hp-thermal-service.sh status           # Detailed status"
+            echo "  sudo /usr/local/bin/hp-thermal-service.sh test-notification # Test notifications"
             echo
             echo "Features:"
             echo "  • Smart temperature monitoring (88°C emergency threshold)"
