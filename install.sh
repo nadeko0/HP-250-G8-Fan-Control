@@ -103,6 +103,22 @@ UDEV_EOF
     udevadm trigger
 }
 
+# Setup modules
+setup_modules() {
+    log_step "Setting up kernel modules..."
+    
+    # ec_sys module
+    log_info "Configuring ec_sys module..."
+    echo "ec_sys" > /etc/modules-load.d/ec_sys.conf
+    echo "options ec_sys write_support=1" > /etc/modprobe.d/ec_sys.conf
+    
+    # Load module now
+    modprobe -r ec_sys 2>/dev/null || true
+    modprobe ec_sys write_support=1
+    
+    log_info "Modules configured"
+}
+
 # Setup desktop notifications
 setup_notifications() {
     log_step "Setting up desktop notifications..."
@@ -169,20 +185,6 @@ setup_notifications() {
         log_warn "Desktop notifications not available - manual installation may be required"
     fi
 }
-setup_modules() {
-    log_step "Setting up kernel modules..."
-    
-    # ec_sys module
-    log_info "Configuring ec_sys module..."
-    echo "ec_sys" > /etc/modules-load.d/ec_sys.conf
-    echo "options ec_sys write_support=1" > /etc/modprobe.d/ec_sys.conf
-    
-    # Load module now
-    modprobe -r ec_sys 2>/dev/null || true
-    modprobe ec_sys write_support=1
-    
-    log_info "Modules configured"
-}
 
 # Create thermal service
 create_thermal_service() {
@@ -205,13 +207,37 @@ CHECK_INTERVAL=3
 HYSTERESIS=3
 COOLING_DOWN_TIME=120
 
-read_ec() { dd if="$ECIO" bs=1 skip=$1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '; }
-write_ec() { echo -n -e "$(printf '\x%02x' $2)" | dd of="$ECIO" bs=1 seek=$1 count=1 conv=notrunc 2>/dev/null; }
+# EC Access functions with proper error checking
+read_ec() { 
+    if [ ! -f "$ECIO" ]; then
+        log_msg "ERROR" "EC not accessible"
+        return 1
+    fi
+    dd if="$ECIO" bs=1 skip=$1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '
+}
+
+write_ec() { 
+    if [ -z "$1" ] || [ -z "$2" ]; then
+        log_msg "ERROR" "write_ec called with invalid parameters: $1, $2"
+        return 1
+    fi
+    if [ ! -f "$ECIO" ]; then
+        log_msg "ERROR" "EC not accessible for write"
+        return 1
+    fi
+    echo -n -e "$(printf '\x%02x' $2)" | dd of="$ECIO" bs=1 seek=$1 count=1 conv=notrunc 2>/dev/null
+}
 
 set_manual() { write_ec 21 1; }
 set_auto() { write_ec 21 0; }
 set_fan_off() { write_ec 25 0; }
-set_fan_speed() { write_ec 25 $1; }
+set_fan_speed() { 
+    if [ -z "$1" ]; then
+        log_msg "ERROR" "set_fan_speed called without speed parameter"
+        return 1
+    fi
+    write_ec 25 "$1"
+}
 set_max_speed() { write_ec 25 50; }
 get_rpm() { read_ec 17; }
 
@@ -260,9 +286,11 @@ detect_user_info() {
         for runtime_dir in /run/user/*/; do
             if [ -d "$runtime_dir" ]; then
                 local uid=$(basename "$runtime_dir")
-                target_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-                if [ -n "$target_user" ] && [ "$target_user" != "root" ] && [ "$uid" -ge 1000 ]; then
+                local temp_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+                if [ -n "$temp_user" ] && [ "$temp_user" != "root" ] && [ "$uid" -ge 1000 ]; then
+                    target_user="$temp_user"
                     user_display=":0"
+                    user_uid="$uid"
                     log_msg "INFO" "Found user via runtime dir: $target_user (uid: $uid)"
                     break
                 fi
@@ -271,8 +299,10 @@ detect_user_info() {
     fi
     
     if [ -n "$target_user" ]; then
-        user_uid=$(id -u "$target_user" 2>/dev/null)
-        if [ -n "$user_uid" ]; then
+        if [ -z "$user_uid" ]; then
+            user_uid=$(id -u "$target_user" 2>/dev/null)
+        fi
+        if [ -n "$user_uid" ] && [ "$user_uid" != "0" ]; then
             # Save user info for later use
             echo "USER=$target_user" > "$USER_INFO_FILE"
             echo "DISPLAY=$user_display" >> "$USER_INFO_FILE"
@@ -294,7 +324,7 @@ send_notification() {
     local cooldown_key=$5
     local cooldown_time=${6:-300}  # 5 minutes default cooldown
     
-    log_msg "INFO" "🔔 NOTIFICATION REQUEST: '$title' (key: $cooldown_key)"
+    log_msg "INFO" "🔔 NOTIFICATION REQUEST: '$title'"
     
     # Check cooldown to avoid spam
     local cooldown_file="${NOTIFICATION_COOLDOWN_FILE}-${cooldown_key}"
@@ -304,13 +334,9 @@ send_notification() {
         local elapsed=$((current_time - last_notif))
         if [ $elapsed -lt $cooldown_time ]; then
             log_msg "INFO" "⏰ Notification skipped (cooldown: ${elapsed}/${cooldown_time}s)"
-            return 0  # Skip notification (still in cooldown)
+            return 0
         fi
     fi
-    
-    # Log current environment
-    log_msg "INFO" "🔍 Current environment: USER=$(whoami), PWD=$PWD"
-    log_msg "INFO" "🔍 Environment vars: DISPLAY='$DISPLAY', XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
     
     # Try to use saved user info first
     local target_user=""
@@ -322,137 +348,28 @@ send_notification() {
         target_user="$USER"
         user_display="$DISPLAY"
         user_uid="$UID"
-        log_msg "INFO" "📁 Using saved user info: $target_user (uid: $user_uid, display: $user_display)"
+        log_msg "INFO" "Using saved user info: $target_user (uid: $user_uid)"
     fi
     
-    # If no saved info or saved info is invalid, detect user again
-    if [ -z "$target_user" ] || ! id "$target_user" >/dev/null 2>&1; then
-        log_msg "INFO" "🔍 Detecting user info dynamically..."
-        
-        # Log all available methods
-        log_msg "INFO" "🔍 WHO output: $(who)"
-        log_msg "INFO" "🔍 LOGINCTL sessions: $(loginctl list-sessions --no-legend 2>/dev/null || echo 'loginctl failed')"
-        log_msg "INFO" "🔍 Users in /home: $(ls /home 2>/dev/null || echo 'no /home')"
-        log_msg "INFO" "🔍 Runtime dirs: $(ls /run/user/ 2>/dev/null || echo 'no runtime dirs')"
-        
-        # Method 1: Check who's logged in with a display (X11)
-        for line in $(who | grep "([:]0[)]"); do
-            target_user=$(echo "$line" | awk '{print $1}')
-            user_display=":0"
-            log_msg "INFO" "✅ Found user via who: $target_user"
-            break
-        done
-        
-        # Method 2: Check active sessions via loginctl
-        if [ -z "$target_user" ]; then
-            target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
-            user_display=":0"
-            [ -n "$target_user" ] && log_msg "INFO" "✅ Found user via loginctl: $target_user"
-        fi
-        
-        # Method 3: Check processes for desktop environments
-        if [ -z "$target_user" ]; then
-            for user in $(ls /home 2>/dev/null); do
-                local processes=$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel" 2>/dev/null)
-                if [ -n "$processes" ]; then
-                    target_user="$user"
-                    user_display=":0"
-                    log_msg "INFO" "✅ Found user via desktop processes: $target_user (processes: $processes)"
-                    break
-                fi
-            done
-        fi
-        
-        # Method 4: Check XDG_RUNTIME_DIR for active sessions
-        if [ -z "$target_user" ]; then
-            for runtime_dir in /run/user/*/; do
-                if [ -d "$runtime_dir" ]; then
-                    local uid=$(basename "$runtime_dir")
-                    local temp_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-                    if [ -n "$temp_user" ] && [ "$temp_user" != "root" ] && [ "$uid" -ge 1000 ]; then
-                        target_user="$temp_user"
-                        user_display=":0"
-                        user_uid="$uid"
-                        log_msg "INFO" "✅ Found user via runtime dir: $target_user (uid: $uid)"
-                        break
-                    fi
-                fi
-            done
-        fi
-        
-        if [ -n "$target_user" ] && [ -z "$user_uid" ]; then
-            user_uid=$(id -u "$target_user" 2>/dev/null)
+    # Validate saved info
+    if [ -z "$target_user" ] || [ -z "$user_uid" ] || [ "$user_uid" = "0" ] || ! id "$target_user" >/dev/null 2>&1; then
+        log_msg "INFO" "Re-detecting user info..."
+        detect_user_info
+        if [ -f "$USER_INFO_FILE" ]; then
+            source "$USER_INFO_FILE" 2>/dev/null
+            target_user="$USER"
+            user_display="$DISPLAY"
+            user_uid="$UID"
         fi
     fi
     
-    if [ -n "$target_user" ] && [ -n "$user_uid" ]; then
-        log_msg "INFO" "🎯 TARGET USER: $target_user (uid: $user_uid, display: $user_display)"
-        
-        # Check if user really exists and has home directory
-        if [ ! -d "/home/$target_user" ]; then
-            log_msg "ERROR" "❌ User home directory not found: /home/$target_user"
-            return 1
-        fi
-        
-        # Check if runtime directory exists
-        if [ ! -d "/run/user/$user_uid" ]; then
-            log_msg "ERROR" "❌ User runtime directory not found: /run/user/$user_uid"
-            return 1
-        fi
-        
-        # Check if display is accessible
-        log_msg "INFO" "🔍 Testing display access for $target_user..."
-        sudo -u "$target_user" DISPLAY="$user_display" xset q >/dev/null 2>&1 && {
-            log_msg "INFO" "✅ Display access OK"
-        } || {
-            log_msg "WARN" "⚠️  Display access failed, trying anyway..."
-        }
-        
+    if [ -n "$target_user" ] && [ -n "$user_uid" ] && [ "$user_uid" != "0" ]; then
+        log_msg "INFO" "🎯 SENDING to $target_user (uid: $user_uid, display: $user_display)"
         local notification_sent=false
         
-        # Try direct script approach first (bypass systemd isolation)
-        log_msg "INFO" "🚀 Trying direct script notification method..."
-        cat > /tmp/hp-thermal-notify.sh << EOF
-#!/bin/bash
-export USER="$target_user"
-export HOME="/home/$target_user"
-export DISPLAY="$user_display"
-export XDG_RUNTIME_DIR="/run/user/$user_uid"
-
-# Try kdialog first
-if command -v kdialog &> /dev/null; then
-    kdialog --title "HP Thermal Control" --passivepopup "$title\\n\\n$message" 10 2>/dev/null && exit 0
-fi
-
-# Try notify-send
-if command -v notify-send &> /dev/null; then
-    notify-send --urgency="$urgency" --icon="$icon" --app-name="HP Thermal Control" --expire-time=10000 "$title" "$message" 2>/dev/null && exit 0
-fi
-
-# Try dbus directly
-if command -v dbus-send &> /dev/null; then
-    dbus-send --session --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:"HP Thermal Control" uint32:0 string:"$icon" string:"$title" string:"$message" array:string: dict:string,variant: int32:10000 2>/dev/null && exit 0
-fi
-
-exit 1
-EOF
-        
-        chmod +x /tmp/hp-thermal-notify.sh
-        
-        # Execute as target user
-        sudo -u "$target_user" /tmp/hp-thermal-notify.sh && {
-            notification_sent=true
-            log_msg "INFO" "✅ Direct script notification SUCCESS"
-        } || {
-            log_msg "WARN" "❌ Direct script notification FAILED"
-        }
-        
-        # Remove temporary script
-        rm -f /tmp/hp-thermal-notify.sh
-        
-        # Try KDE notifications (original method)
+        # Try KDE notifications first (kdialog)
         if [ "$notification_sent" = false ] && command -v kdialog &> /dev/null; then
-            log_msg "INFO" "🔄 Trying kdialog notification..."
+            log_msg "INFO" "Trying kdialog notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
                 HOME="/home/$target_user" \
@@ -467,7 +384,7 @@ EOF
         
         # Try notify-send if kdialog failed
         if [ "$notification_sent" = false ] && command -v notify-send &> /dev/null; then
-            log_msg "INFO" "🔄 Trying notify-send notification..."
+            log_msg "INFO" "Trying notify-send notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
                 HOME="/home/$target_user" \
@@ -485,19 +402,33 @@ EOF
             }
         fi
         
+        # Try direct KDE notification via dbus
+        if [ "$notification_sent" = false ]; then
+            log_msg "INFO" "Trying dbus notification..."
+            sudo -u "$target_user" DISPLAY="$user_display" \
+                XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                HOME="/home/$target_user" \
+                dbus-send --session --dest=org.freedesktop.Notifications \
+                /org/freedesktop/Notifications \
+                org.freedesktop.Notifications.Notify \
+                string:"HP Thermal Control" uint32:0 string:"$icon" \
+                string:"$title" string:"$message" \
+                array:string: dict:string,variant: int32:10000 2>/dev/null && {
+                notification_sent=true
+                log_msg "INFO" "✅ dbus notification SUCCESS"
+            } || {
+                log_msg "WARN" "❌ dbus notification FAILED"
+            }
+        fi
+        
         if [ "$notification_sent" = true ]; then
-            # Update cooldown
             echo "$(date +%s)" > "$cooldown_file"
             log_msg "NOTIF" "🔔 NOTIFICATION DELIVERED to $target_user: $title"
         else
             log_msg "ERROR" "❌ ALL NOTIFICATION METHODS FAILED for user $target_user"
-            log_msg "ERROR" "❌ Debug: Check if $target_user has an active desktop session"
         fi
     else
         log_msg "ERROR" "❌ NO VALID USER FOUND FOR NOTIFICATIONS"
-        log_msg "ERROR" "❌ Debug info: target_user='$target_user', user_uid='$user_uid', user_display='$user_display'"
-        log_msg "ERROR" "❌ Available users: $(ls /home 2>/dev/null | tr '\n' ' ')"
-        log_msg "ERROR" "❌ Active sessions: $(who | tr '\n' ' ')"
     fi
 }
 
@@ -515,14 +446,12 @@ emergency_auto() {
     set_auto
     sleep 1
     if [ $(read_ec 21) -ne 0 ]; then
-        log_msg "EMERGENCY" "Reloading ec_sys module..."
-        rmmod ec_sys 2>/dev/null
-        sleep 1
-        modprobe ec_sys write_support=1
-        sleep 2
+        log_msg "EMERGENCY" "EC mode still manual, forcing AUTO again..."
         set_auto
+        sleep 2
     fi
-    log_msg "INFO" "AUTO mode restored. Mode=$(read_ec 21)"
+    local final_mode=$(read_ec 21)
+    log_msg "INFO" "AUTO mode set. Final EC Mode: $final_mode"
 }
 
 emergency_cooling() {
@@ -540,15 +469,15 @@ emergency_cooling() {
     sleep 0.5
     set_max_speed
     
-    total_time=0
-    check_interval=2
-    max_cooling_time=300  # 5 minutes max emergency cooling
+    local total_time=0
+    local check_interval=2
+    local max_cooling_time=300  # 5 minutes max emergency cooling
     
     log_msg "INFO" "Holding maximum cooling until temperature drops below ${COOLING_RECOVERY_TEMP}°C"
     
     while [ $total_time -lt $max_cooling_time ]; do
-        temp=$(get_temperature)
-        rpm=$(get_rpm)
+        local temp=$(get_temperature)
+        local rpm=$(get_rpm)
         
         log_msg "COOLING" "Emergency cooling: ${total_time}s | Temp: ${temp}°C | RPM: $rpm | Target: <${COOLING_RECOVERY_TEMP}°C"
         
@@ -591,7 +520,7 @@ emergency_cooling() {
     done
     
     # If we reach here, emergency cooling took too long
-    temp=$(get_temperature)
+    local temp=$(get_temperature)
     log_msg "EMERGENCY" "Emergency cooling timeout (${max_cooling_time}s)! Temperature still ${temp}°C. Switching to AUTO"
     
     # Send timeout notification
@@ -633,8 +562,7 @@ is_cooling_down_expired() {
             rm -f "$cooling_start_file"
             return 0  # Cooling down period expired
         else
-            local remaining=$((COOLING_DOWN_TIME - elapsed))
-            return 1  # Still cooling down (return remaining time via global var)
+            return 1  # Still cooling down
         fi
     else
         return 0  # No cooling down period
@@ -658,11 +586,12 @@ main_loop() {
     # Detect user for notifications at startup
     detect_user_info
     
-    current_state=$(get_state)
-    error_count=0
-    overheat_protection_count=0
+    local current_state=$(get_state)
+    local error_count=0
+    local overheat_protection_count=0
     
     while true; do
+        # Periodic EC check
         if [ $(($(date +%s) % 30)) -eq 0 ]; then
             if ! check_ec; then
                 error_count=$((error_count + 1))
@@ -677,9 +606,9 @@ main_loop() {
             error_count=0
         fi
         
-        temp=$(get_temperature)
-        mode=$(read_ec 21)
-        rpm=$(get_rpm)
+        local temp=$(get_temperature)
+        local mode=$(read_ec 21)
+        local rpm=$(get_rpm)
         
         # CRITICAL PROTECTION: If temperature is extremely high, force immediate action
         if [ $temp -gt 100 ]; then
@@ -712,12 +641,9 @@ main_loop() {
             continue
         fi
         
-        # Additional temperature alerts (independent of state machine)
+        # High temperature alert (independent of state machine)
         if [ $temp -gt 95 ] && [ "$current_state" != "cooling_down" ]; then
-            log_msg "ALERT" "🔥 HIGH TEMPERATURE DETECTED: ${temp}°C - FORCING NOTIFICATION"
-            
-            # FORCE notification by removing cooldown temporarily
-            rm -f "${NOTIFICATION_COOLDOWN_FILE}-high_temp_alert" 2>/dev/null
+            log_msg "ALERT" "🔥 HIGH TEMPERATURE DETECTED: ${temp}°C - SENDING NOTIFICATION"
             
             send_notification "critical" \
                 "🌡️ High Temperature Warning" \
@@ -798,12 +724,12 @@ main_loop() {
                         set_auto
                     fi
                     
-                    cooling_start_file="/tmp/hp-thermal-cooling-start"
+                    local cooling_start_file="/tmp/hp-thermal-cooling-start"
                     if [ -f "$cooling_start_file" ]; then
-                        start_time=$(cat "$cooling_start_file")
-                        current_time=$(date +%s)
-                        elapsed=$((current_time - start_time))
-                        remaining=$((COOLING_DOWN_TIME - elapsed))
+                        local start_time=$(cat "$cooling_start_file")
+                        local current_time=$(date +%s)
+                        local elapsed=$((current_time - start_time))
+                        local remaining=$((COOLING_DOWN_TIME - elapsed))
                         if [ $(($(date +%s) % 30)) -eq 0 ]; then
                             log_msg "INFO" "Cooling down: ${remaining}s remaining | Temp: ${temp}°C | Keeping AUTO mode"
                         fi
@@ -821,15 +747,16 @@ main_loop() {
                 ;;
         esac
         
+        # Status logging
         if [ $(($(date +%s) % 30)) -eq 0 ]; then
-            status_msg="Temp: ${temp}°C | State: $current_state | Mode: $mode | RPM: $rpm"
+            local status_msg="Temp: ${temp}°C | State: $current_state | Mode: $mode | RPM: $rpm"
             # Add cooling down info if active
-            cooling_start_file="/tmp/hp-thermal-cooling-start"
+            local cooling_start_file="/tmp/hp-thermal-cooling-start"
             if [ -f "$cooling_start_file" ] && [ "$current_state" = "cooling_down" ]; then
-                start_time=$(cat "$cooling_start_file")
-                current_time=$(date +%s)
-                elapsed=$((current_time - start_time))
-                remaining=$((COOLING_DOWN_TIME - elapsed))
+                local start_time=$(cat "$cooling_start_file")
+                local current_time=$(date +%s)
+                local elapsed=$((current_time - start_time))
+                local remaining=$((COOLING_DOWN_TIME - elapsed))
                 status_msg="$status_msg | CoolDown: ${remaining}s"
             fi
             log_msg "STATUS" "$status_msg"
