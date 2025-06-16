@@ -119,72 +119,7 @@ setup_modules() {
     log_info "Modules configured"
 }
 
-# Setup desktop notifications
-setup_notifications() {
-    log_step "Setting up desktop notifications..."
-    
-    # Check if notification tools are available
-    local notification_tools_available=false
-    
-    if command -v notify-send &> /dev/null; then
-        log_info "notify-send found"
-        notification_tools_available=true
-    fi
-    
-    if command -v kdialog &> /dev/null; then
-        log_info "kdialog found (KDE)"
-        notification_tools_available=true
-    fi
-    
-    if command -v zenity &> /dev/null; then
-        log_info "zenity found"
-        notification_tools_available=true
-    fi
-    
-    # Install notification support if needed
-    if [ "$notification_tools_available" = false ]; then
-        log_info "Installing notification support..."
-        
-        case "$OS_ID" in
-            "ubuntu"|"debian"|"linuxmint")
-                apt-get update -qq && apt-get install -y libnotify-bin zenity
-                ;;
-            "fedora"|"rhel"|"centos")
-                dnf install -y libnotify zenity || yum install -y libnotify zenity
-                ;;
-            "arch"|"manjaro"|"endeavouros")
-                pacman -S --noconfirm libnotify zenity
-                ;;
-            "opensuse"|"suse")
-                zypper install -y libnotify-tools zenity
-                ;;
-            *)
-                log_warn "Unknown distribution. Please install notification tools manually:"
-                log_warn "  - For GNOME/XFCE: libnotify-bin or notify-send"
-                log_warn "  - For KDE: kdialog (usually pre-installed)"
-                log_warn "  - Universal: zenity"
-                ;;
-        esac
-    fi
-    
-    # Test notification support
-    if command -v notify-send &> /dev/null || command -v kdialog &> /dev/null || command -v zenity &> /dev/null; then
-        log_info "Desktop notifications enabled"
-        
-        # Detect desktop environment for optimal support
-        if [ -n "$KDE_SESSION_VERSION" ] || [ "$XDG_CURRENT_DESKTOP" = "KDE" ]; then
-            log_info "KDE Plasma detected - using kdialog for notifications"
-        elif [ "$XDG_CURRENT_DESKTOP" = "GNOME" ] || [ -n "$GNOME_DESKTOP_SESSION_ID" ]; then
-            log_info "GNOME detected - using notify-send for notifications"
-        elif [ "$XDG_CURRENT_DESKTOP" = "XFCE" ]; then
-            log_info "XFCE detected - using notify-send for notifications"
-        else
-            log_info "Using available notification tools"
-        fi
-    else
-        log_warn "Desktop notifications not available - manual installation may be required"
-    fi
-}
+
 
 # Create thermal service
 create_thermal_service() {
@@ -197,8 +132,6 @@ create_thermal_service() {
 ECIO=/sys/kernel/debug/ec/ec0/io
 LOG_FILE="/var/log/hp-thermal.log"
 STATE_FILE="/tmp/hp-thermal-state"
-NOTIFICATION_COOLDOWN_FILE="/tmp/hp-thermal-notif-cooldown"
-USER_INFO_FILE="/tmp/hp-thermal-user-info"
 TEMP_THRESHOLD=60
 EMERGENCY_COOLING_TEMP=88
 COOLING_RECOVERY_TEMP=82
@@ -247,191 +180,6 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*" | tee -a "$LOG_FILE"
 }
 
-detect_user_info() {
-    log_msg "INFO" "Detecting active user for notifications..."
-    
-    local target_user=""
-    local user_display=""
-    local user_uid=""
-    
-    # Method 1: Check who's logged in with a display (X11)
-    for line in $(who | grep "([:]0[)]"); do
-        target_user=$(echo "$line" | awk '{print $1}')
-        user_display=":0"
-        log_msg "INFO" "Found user via who: $target_user"
-        break
-    done
-    
-    # Method 2: Check active sessions via loginctl
-    if [ -z "$target_user" ]; then
-        target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
-        user_display=":0"
-        [ -n "$target_user" ] && log_msg "INFO" "Found user via loginctl: $target_user"
-    fi
-    
-    # Method 3: Check processes for desktop environments
-    if [ -z "$target_user" ]; then
-        for user in $(ls /home 2>/dev/null); do
-            if [ -n "$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel")" ]; then
-                target_user="$user"
-                user_display=":0"
-                log_msg "INFO" "Found user via desktop processes: $target_user"
-                break
-            fi
-        done
-    fi
-    
-    # Method 4: Check XDG_RUNTIME_DIR for active sessions
-    if [ -z "$target_user" ]; then
-        for runtime_dir in /run/user/*/; do
-            if [ -d "$runtime_dir" ]; then
-                local uid=$(basename "$runtime_dir")
-                local temp_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-                if [ -n "$temp_user" ] && [ "$temp_user" != "root" ] && [ "$uid" -ge 1000 ]; then
-                    target_user="$temp_user"
-                    user_display=":0"
-                    user_uid="$uid"
-                    log_msg "INFO" "Found user via runtime dir: $target_user (uid: $uid)"
-                    break
-                fi
-            fi
-        done
-    fi
-    
-    if [ -n "$target_user" ]; then
-        if [ -z "$user_uid" ]; then
-            user_uid=$(id -u "$target_user" 2>/dev/null)
-        fi
-        if [ -n "$user_uid" ] && [ "$user_uid" != "0" ]; then
-            # Save user info for later use
-            echo "USER=$target_user" > "$USER_INFO_FILE"
-            echo "DISPLAY=$user_display" >> "$USER_INFO_FILE"
-            echo "UID=$user_uid" >> "$USER_INFO_FILE"
-            log_msg "INFO" "Saved user info: $target_user (uid: $user_uid, display: $user_display)"
-            return 0
-        fi
-    fi
-    
-    log_msg "WARN" "Could not detect active user for notifications"
-    return 1
-}
-
-send_notification() {
-    local urgency=$1
-    local title=$2
-    local message=$3
-    local icon=$4
-    local cooldown_key=$5
-    local cooldown_time=${6:-300}  # 5 minutes default cooldown
-    
-    log_msg "INFO" "🔔 NOTIFICATION REQUEST: '$title'"
-    
-    # Check cooldown to avoid spam
-    local cooldown_file="${NOTIFICATION_COOLDOWN_FILE}-${cooldown_key}"
-    if [ -f "$cooldown_file" ]; then
-        local last_notif=$(cat "$cooldown_file")
-        local current_time=$(date +%s)
-        local elapsed=$((current_time - last_notif))
-        if [ $elapsed -lt $cooldown_time ]; then
-            log_msg "INFO" "⏰ Notification skipped (cooldown: ${elapsed}/${cooldown_time}s)"
-            return 0
-        fi
-    fi
-    
-    # Try to use saved user info first
-    local target_user=""
-    local user_display=""
-    local user_uid=""
-    
-    if [ -f "$USER_INFO_FILE" ]; then
-        source "$USER_INFO_FILE" 2>/dev/null
-        target_user="$USER"
-        user_display="$DISPLAY"
-        user_uid="$UID"
-        log_msg "INFO" "Using saved user info: $target_user (uid: $user_uid)"
-    fi
-    
-    # Validate saved info
-    if [ -z "$target_user" ] || [ -z "$user_uid" ] || [ "$user_uid" = "0" ] || ! id "$target_user" >/dev/null 2>&1; then
-        log_msg "INFO" "Re-detecting user info..."
-        detect_user_info
-        if [ -f "$USER_INFO_FILE" ]; then
-            source "$USER_INFO_FILE" 2>/dev/null
-            target_user="$USER"
-            user_display="$DISPLAY"
-            user_uid="$UID"
-        fi
-    fi
-    
-    if [ -n "$target_user" ] && [ -n "$user_uid" ] && [ "$user_uid" != "0" ]; then
-        log_msg "INFO" "🎯 SENDING to $target_user (uid: $user_uid, display: $user_display)"
-        local notification_sent=false
-        
-        # Try KDE notifications first (kdialog)
-        if [ "$notification_sent" = false ] && command -v kdialog &> /dev/null; then
-            log_msg "INFO" "Trying kdialog notification..."
-            sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$user_uid" \
-                HOME="/home/$target_user" \
-                kdialog --title "HP Thermal Control" \
-                --passivepopup "$title\n\n$message" 10 2>/dev/null && {
-                notification_sent=true
-                log_msg "INFO" "✅ kdialog notification SUCCESS"
-            } || {
-                log_msg "WARN" "❌ kdialog notification FAILED"
-            }
-        fi
-        
-        # Try notify-send if kdialog failed
-        if [ "$notification_sent" = false ] && command -v notify-send &> /dev/null; then
-            log_msg "INFO" "Trying notify-send notification..."
-            sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$user_uid" \
-                HOME="/home/$target_user" \
-                notify-send \
-                --urgency="$urgency" \
-                --icon="$icon" \
-                --app-name="HP Thermal Control" \
-                --expire-time=10000 \
-                "$title" \
-                "$message" 2>/dev/null && {
-                notification_sent=true
-                log_msg "INFO" "✅ notify-send notification SUCCESS"
-            } || {
-                log_msg "WARN" "❌ notify-send notification FAILED"
-            }
-        fi
-        
-        # Try direct KDE notification via dbus
-        if [ "$notification_sent" = false ]; then
-            log_msg "INFO" "Trying dbus notification..."
-            sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$user_uid" \
-                HOME="/home/$target_user" \
-                dbus-send --session --dest=org.freedesktop.Notifications \
-                /org/freedesktop/Notifications \
-                org.freedesktop.Notifications.Notify \
-                string:"HP Thermal Control" uint32:0 string:"$icon" \
-                string:"$title" string:"$message" \
-                array:string: dict:string,variant: int32:10000 2>/dev/null && {
-                notification_sent=true
-                log_msg "INFO" "✅ dbus notification SUCCESS"
-            } || {
-                log_msg "WARN" "❌ dbus notification FAILED"
-            }
-        fi
-        
-        if [ "$notification_sent" = true ]; then
-            echo "$(date +%s)" > "$cooldown_file"
-            log_msg "NOTIF" "🔔 NOTIFICATION DELIVERED to $target_user: $title"
-        else
-            log_msg "ERROR" "❌ ALL NOTIFICATION METHODS FAILED for user $target_user"
-        fi
-    else
-        log_msg "ERROR" "❌ NO VALID USER FOUND FOR NOTIFICATIONS"
-    fi
-}
-
 get_temperature() {
     local temp=$(sensors 2>/dev/null | grep "Package id 0" | grep -o "+[0-9]*" | head -1 | tr -d '+')
     if [ -z "$temp" ]; then
@@ -457,14 +205,6 @@ emergency_auto() {
 emergency_cooling() {
     log_msg "EMERGENCY" "Critical temperature! Starting aggressive cooling (max speed 50)"
     
-    # Send immediate notification
-    send_notification "critical" \
-        "🔥 High Temperature Alert" \
-        "CPU temperature is critical! Emergency cooling activated.\nFan running at maximum speed." \
-        "dialog-warning" \
-        "emergency_start" \
-        180  # 3 minute cooldown
-    
     set_manual
     sleep 0.5
     set_max_speed
@@ -486,14 +226,6 @@ emergency_cooling() {
             log_msg "INFO" "SUCCESS! Temperature dropped to ${temp}°C after ${total_time}s of emergency cooling"
             log_msg "INFO" "Starting 2-minute AUTO cooling down period"
             
-            # Send success notification
-            send_notification "normal" \
-                "✅ Temperature Stabilized" \
-                "Emergency cooling successful! Temperature: ${temp}°C\nSwitching to normal cooling mode." \
-                "dialog-information" \
-                "emergency_success" \
-                600  # 10 minute cooldown
-            
             set_auto
             echo "$(date +%s)" > /tmp/hp-thermal-cooling-start
             return 0
@@ -502,14 +234,6 @@ emergency_cooling() {
         # Critical temperature check
         if [ $temp -gt $CRITICAL_EMERGENCY_TEMP ]; then
             log_msg "CRITICAL" "DANGER! Temperature ${temp}°C > ${CRITICAL_EMERGENCY_TEMP}°C! Switching to system AUTO"
-            
-            # Send critical notification
-            send_notification "critical" \
-                "🚨 CRITICAL TEMPERATURE!" \
-                "CPU temperature reached ${temp}°C!\nSwitching to emergency system cooling." \
-                "dialog-error" \
-                "critical_temp" \
-                60  # 1 minute cooldown for critical alerts
             
             emergency_auto
             return 1
@@ -522,14 +246,6 @@ emergency_cooling() {
     # If we reach here, emergency cooling took too long
     local temp=$(get_temperature)
     log_msg "EMERGENCY" "Emergency cooling timeout (${max_cooling_time}s)! Temperature still ${temp}°C. Switching to AUTO"
-    
-    # Send timeout notification
-    send_notification "critical" \
-        "⚠️ Cooling Timeout" \
-        "Emergency cooling took too long.\nTemperature: ${temp}°C - Switching to auto mode." \
-        "dialog-warning" \
-        "cooling_timeout" \
-        300  # 5 minute cooldown
     
     set_auto
     echo "$(date +%s)" > /tmp/hp-thermal-cooling-start
@@ -574,17 +290,12 @@ cleanup() {
     emergency_auto
     rm -f "$STATE_FILE"
     rm -f /tmp/hp-thermal-cooling-start
-    rm -f /tmp/hp-thermal-notif-cooldown-*
-    rm -f "$USER_INFO_FILE"
     exit 0
 }
 trap cleanup SIGTERM SIGINT SIGQUIT
 
 main_loop() {
     log_msg "INFO" "HP 250 G8 Thermal Service started (threshold: ${TEMP_THRESHOLD}°C, emergency: ${EMERGENCY_COOLING_TEMP}°C)"
-    
-    # Detect user for notifications at startup
-    detect_user_info
     
     local current_state=$(get_state)
     local error_count=0
@@ -614,27 +325,10 @@ main_loop() {
         if [ $temp -gt 100 ]; then
             log_msg "CRITICAL" "EXTREME TEMPERATURE ${temp}°C! FORCING IMMEDIATE AUTO MODE!"
             
-            # Send immediate extreme temperature notification
-            send_notification "critical" \
-                "🆘 EXTREME TEMPERATURE!" \
-                "CPU reached ${temp}°C - IMMEDIATE ACTION REQUIRED!\nForcing emergency cooling now!" \
-                "dialog-error" \
-                "extreme_temp" \
-                30  # 30 second cooldown for extreme alerts
-            
             emergency_auto
             overheat_protection_count=$((overheat_protection_count + 1))
             if [ $overheat_protection_count -gt 5 ]; then
                 log_msg "CRITICAL" "Repeated extreme overheating! System may be damaged. Shutting down service."
-                
-                # Final critical notification
-                send_notification "critical" \
-                    "🚨 THERMAL PROTECTION SHUTDOWN" \
-                    "Repeated extreme overheating detected!\nThermal service stopping for safety." \
-                    "dialog-error" \
-                    "thermal_shutdown" \
-                    0  # No cooldown for shutdown notification
-                
                 exit 1
             fi
             sleep 1
@@ -643,14 +337,7 @@ main_loop() {
         
         # High temperature alert (independent of state machine)
         if [ $temp -gt 95 ] && [ "$current_state" != "cooling_down" ]; then
-            log_msg "ALERT" "🔥 HIGH TEMPERATURE DETECTED: ${temp}°C - SENDING NOTIFICATION"
-            
-            send_notification "critical" \
-                "🌡️ High Temperature Warning" \
-                "CPU temperature: ${temp}°C\nThermal management active." \
-                "dialog-warning" \
-                "high_temp_alert" \
-                60  # 1 minute cooldown for temperature alerts
+            log_msg "ALERT" "🔥 HIGH TEMPERATURE DETECTED: ${temp}°C"
         fi
         
         if [ $temp -gt $CRITICAL_EMERGENCY_TEMP ]; then
@@ -768,7 +455,7 @@ main_loop() {
 
 case "$1" in
     "start") main_loop ;;
-    "stop") emergency_auto; rm -f "$STATE_FILE"; rm -f /tmp/hp-thermal-cooling-start; rm -f /tmp/hp-thermal-notif-cooldown-*; rm -f "$USER_INFO_FILE"; log_msg "INFO" "Service stopped" ;;
+    "stop") emergency_auto; rm -f "$STATE_FILE"; rm -f /tmp/hp-thermal-cooling-start; log_msg "INFO" "Service stopped" ;;
     "status")
         temp=$(get_temperature)
         mode=$(read_ec 21)
@@ -783,7 +470,6 @@ case "$1" in
         echo "Emergency Cooling: ${EMERGENCY_COOLING_TEMP}°C"
         echo "Recovery Target: ${COOLING_RECOVERY_TEMP}°C"
         echo "Max Fan Speed: 50"
-        echo "Desktop Notifications: Enabled"
         
         # Safety warnings
         if [ "$temp" != "N/A" ] && [ $temp -gt $EMERGENCY_COOLING_TEMP ]; then
@@ -804,32 +490,9 @@ case "$1" in
                 echo "Cooling Down: ${remaining}s remaining"
             fi
         fi
-        
-        # Show notification cooldowns (for debugging)
-        notif_files=$(ls /tmp/hp-thermal-notif-cooldown-* 2>/dev/null | wc -l)
-        if [ $notif_files -gt 0 ]; then
-            echo "Active notification cooldowns: $notif_files"
-        fi
-        ;;
-    "test-notification")
-        log_msg "INFO" "Testing desktop notification..."
-        temp=$(get_temperature)
-        
-        # Force detect user info
-        detect_user_info
-        
-        # Remove any cooldowns for test
-        rm -f /tmp/hp-thermal-notif-cooldown-* 2>/dev/null
-        
-        send_notification "normal" \
-            "🧪 HP Thermal Test" \
-            "Test notification from HP Thermal Control\nCurrent temperature: ${temp}°C" \
-            "dialog-information" \
-            "test_notification" \
-            0  # No cooldown for test
         ;;
     "auto") emergency_auto ;;
-    *) echo "Usage: $0 {start|stop|status|auto|test-notification}"; exit 1 ;;
+    *) echo "Usage: $0 {start|stop|status|auto}"; exit 1 ;;
 esac
 THERMAL_EOF
 
@@ -925,7 +588,7 @@ main() {
     echo "║                    Version 3.0 - 2025                       ║"
     echo "║              github.com/nadeko0/HP-250-G8-Fan-Control       ║"
     echo "║                                                              ║"
-    echo "║    🔥 Smart Thermal Control  📱 Desktop Notifications       ║"
+    echo "║          🔥 Smart Thermal Control & Protection              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
@@ -937,7 +600,6 @@ main() {
             log_step "Starting installation..."
             setup_debugfs
             setup_modules
-            setup_notifications
             create_thermal_service
             
             log_step "Post-installation diagnostics..."
@@ -952,14 +614,13 @@ main() {
             echo "  sudo journalctl -u hp-thermal -f    # View logs"
             echo
             echo "Service commands:"
-            echo "  sudo /usr/local/bin/hp-thermal-service.sh status           # Detailed status"
-            echo "  sudo /usr/local/bin/hp-thermal-service.sh test-notification # Test notifications"
+            echo "  sudo /usr/local/bin/hp-thermal-service.sh status    # Detailed status"
             echo
             echo "Features:"
             echo "  • Smart temperature monitoring (88°C emergency threshold)"
-            echo "  • Desktop notifications for critical temperatures"
             echo "  • Maximum fan speed: 50 (aggressive cooling)"
             echo "  • 2-minute cooling down periods"
+            echo "  • Robust thermal protection"
             echo
             
             read -p "Enable service autostart? (y/N): " -n 1 -r
@@ -974,61 +635,6 @@ main() {
                     systemctl start hp-thermal
                     sleep 3
                     systemctl status hp-thermal --no-pager
-                    
-                    # Test notification if user is available
-                    read -p "Test desktop notification? (y/N): " -n 1 -r
-                    echo
-                    if [[ $REPLY =~ ^[Yy]$ ]]; then
-                        # Find user for test notification
-                        test_user=""
-                        for line in $(who | grep "([:]0[)]"); do
-                            test_user=$(echo "$line" | awk '{print $1}')
-                            break
-                        done
-                        
-                        if [ -z "$test_user" ]; then
-                            test_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
-                        fi
-                        
-                        if [ -z "$test_user" ]; then
-                            test_user=$(ls /home 2>/dev/null | head -1)
-                        fi
-                        
-                        if [ -n "$test_user" ]; then
-                            log_info "Testing notification for user: $test_user"
-                            
-                            # Try KDE first
-                            if command -v kdialog &> /dev/null; then
-                                sudo -u "$test_user" DISPLAY=":0" kdialog \
-                                    --title "HP Thermal Control" \
-                                    --passivepopup "✅ Installation Complete!\n\nHP 250 G8 thermal management is now active.\nYou'll receive notifications for critical temperatures." 5 2>/dev/null && {
-                                    log_info "KDE notification test successful!"
-                                } || {
-                                    log_warn "KDE notification test failed"
-                                }
-                            fi
-                            
-                            # Try notify-send as fallback
-                            if command -v notify-send &> /dev/null; then
-                                sudo -u "$test_user" DISPLAY=":0" \
-                                    XDG_RUNTIME_DIR="/run/user/$(id -u "$test_user")" \
-                                    notify-send \
-                                    --urgency="normal" \
-                                    --icon="dialog-information" \
-                                    --app-name="HP Thermal Control" \
-                                    --expire-time=5000 \
-                                    "✅ Installation Complete!" \
-                                    "HP 250 G8 thermal management is now active.\nYou'll receive notifications for critical temperatures." \
-                                    2>/dev/null && {
-                                    log_info "notify-send test successful!"
-                                } || {
-                                    log_warn "notify-send test failed"
-                                }
-                            fi
-                        else
-                            log_warn "No active user found for notification test"
-                        fi
-                    fi
                 fi
             fi
             ;;
@@ -1046,13 +652,11 @@ main() {
             rm -f /etc/udev/rules.d/99-ec-debug.rules
             rm -f /tmp/hp-thermal-state
             rm -f /tmp/hp-thermal-cooling-start
-            rm -f /tmp/hp-thermal-notif-cooldown-*
-            rm -f "$USER_INFO_FILE"
             
             systemctl daemon-reload
             udevadm control --reload-rules
             
-            log_info "Uninstallation completed (notification preferences preserved)"
+            log_info "Uninstallation completed"
             ;;
             
         "diagnose")
