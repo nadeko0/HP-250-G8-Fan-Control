@@ -136,6 +136,7 @@ COOLING_RECOVERY_TEMP=85
 EMERGENCY_TEMP=95
 CHECK_INTERVAL=3
 HYSTERESIS=3
+COOLING_DOWN_TIME=120
 
 read_ec() { dd if="$ECIO" bs=1 skip=$1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '; }
 write_ec() { echo -n -e "$(printf '\x%02x' $2)" | dd of="$ECIO" bs=1 seek=$1 count=1 conv=notrunc 2>/dev/null; }
@@ -195,8 +196,9 @@ emergency_cooling() {
     log_msg "INFO" "Emergency cooling complete. Temperature: ${temp}°C"
     
     if [ $temp -lt $COOLING_RECOVERY_TEMP ]; then
-        log_msg "INFO" "Temperature below ${COOLING_RECOVERY_TEMP}°C, switching to AUTO mode"
+        log_msg "INFO" "Temperature below ${COOLING_RECOVERY_TEMP}°C, starting 2-minute cooling down period"
         set_auto
+        echo "$(date +%s)" > /tmp/hp-thermal-cooling-start
         return 0
     else
         log_msg "WARN" "Temperature still high (${temp}°C), keeping max cooling"
@@ -220,10 +222,29 @@ check_ec() {
 get_state() { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "auto"; }
 set_state() { echo "$1" > "$STATE_FILE"; }
 
+is_cooling_down_expired() {
+    local cooling_start_file="/tmp/hp-thermal-cooling-start"
+    if [ -f "$cooling_start_file" ]; then
+        local start_time=$(cat "$cooling_start_file")
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        if [ $elapsed -ge $COOLING_DOWN_TIME ]; then
+            rm -f "$cooling_start_file"
+            return 0  # Cooling down period expired
+        else
+            local remaining=$((COOLING_DOWN_TIME - elapsed))
+            return 1  # Still cooling down (return remaining time via global var)
+        fi
+    else
+        return 0  # No cooling down period
+    fi
+}
+
 cleanup() {
     log_msg "INFO" "Received termination signal, restoring AUTO mode..."
     emergency_auto
     rm -f "$STATE_FILE"
+    rm -f /tmp/hp-thermal-cooling-start
     exit 0
 }
 trap cleanup SIGTERM SIGINT SIGQUIT
@@ -261,7 +282,7 @@ main_loop() {
         elif [ $temp -gt $EMERGENCY_COOLING_TEMP ]; then
             log_msg "EMERGENCY" "High temperature ${temp}°C! Starting emergency cooling"
             if emergency_cooling; then
-                current_state="active"
+                current_state="cooling_down"
                 set_state "$current_state"
             else
                 current_state="emergency_cooling"
@@ -317,10 +338,60 @@ main_loop() {
                     set_state "$current_state"
                 fi
                 ;;
+            "cooling_down")
+                if is_cooling_down_expired; then
+                    if [ $temp -lt $((TEMP_THRESHOLD - HYSTERESIS)) ]; then
+                        log_msg "INFO" "Cooling down period completed. Temperature ${temp}°C, switching to silent mode"
+                        set_manual
+                        sleep 0.5
+                        set_fan_off
+                        current_state="silent"
+                        set_state "$current_state"
+                    else
+                        log_msg "INFO" "Cooling down period completed. Temperature ${temp}°C, staying in active mode"
+                        current_state="active"
+                        set_state "$current_state"
+                    fi
+                else
+                    # Still in cooling down period, keep AUTO mode
+                    local cooling_start_file="/tmp/hp-thermal-cooling-start"
+                    if [ -f "$cooling_start_file" ]; then
+                        local start_time=$(cat "$cooling_start_file")
+                        local current_time=$(date +%s)
+                        local elapsed=$((current_time - start_time))
+                        local remaining=$((COOLING_DOWN_TIME - elapsed))
+                        if [ $(($(date +%s) % 30)) -eq 0 ]; then
+                            log_msg "INFO" "Cooling down period: ${remaining}s remaining, keeping AUTO mode"
+                        fi
+                    fi
+                    # Check if temperature spikes again
+                    if [ $temp -gt $EMERGENCY_COOLING_TEMP ]; then
+                        log_msg "WARN" "Temperature spike during cooling down! Restarting emergency cooling"
+                        rm -f /tmp/hp-thermal-cooling-start
+                        if emergency_cooling; then
+                            current_state="cooling_down"
+                            set_state "$current_state"
+                        else
+                            current_state="emergency_cooling"
+                            set_state "$current_state"
+                        fi
+                    fi
+                fi
+                ;;
         esac
         
         if [ $(($(date +%s) % 30)) -eq 0 ]; then
-            log_msg "STATUS" "Temp: ${temp}°C | State: $current_state | Mode: $mode | RPM: $rpm"
+            local status_msg="Temp: ${temp}°C | State: $current_state | Mode: $mode | RPM: $rpm"
+            # Add cooling down info if active
+            local cooling_start_file="/tmp/hp-thermal-cooling-start"
+            if [ -f "$cooling_start_file" ] && [ "$current_state" = "cooling_down" ]; then
+                local start_time=$(cat "$cooling_start_file")
+                local current_time=$(date +%s)
+                local elapsed=$((current_time - start_time))
+                local remaining=$((COOLING_DOWN_TIME - elapsed))
+                status_msg="$status_msg | CoolDown: ${remaining}s"
+            fi
+            log_msg "STATUS" "$status_msg"
         fi
         
         sleep $CHECK_INTERVAL
@@ -329,7 +400,7 @@ main_loop() {
 
 case "$1" in
     "start") main_loop ;;
-    "stop") emergency_auto; rm -f "$STATE_FILE"; log_msg "INFO" "Service stopped" ;;
+    "stop") emergency_auto; rm -f "$STATE_FILE"; rm -f /tmp/hp-thermal-cooling-start; log_msg "INFO" "Service stopped" ;;
     "status")
         temp=$(get_temperature)
         mode=$(read_ec 21)
@@ -341,6 +412,18 @@ case "$1" in
         echo "EC Mode: $mode (0=auto, 1=manual)"
         echo "Fan RPM: $rpm"
         echo "Threshold: ${TEMP_THRESHOLD}°C"
+        
+        # Check cooling down status
+        local cooling_start_file="/tmp/hp-thermal-cooling-start"
+        if [ -f "$cooling_start_file" ]; then
+            local start_time=$(cat "$cooling_start_file")
+            local current_time=$(date +%s)
+            local elapsed=$((current_time - start_time))
+            local remaining=$((COOLING_DOWN_TIME - elapsed))
+            if [ $remaining -gt 0 ]; then
+                echo "Cooling Down: ${remaining}s remaining"
+            fi
+        fi
         ;;
     "auto") emergency_auto ;;
     *) echo "Usage: $0 {start|stop|status|auto}"; exit 1 ;;
