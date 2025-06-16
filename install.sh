@@ -107,33 +107,66 @@ UDEV_EOF
 setup_notifications() {
     log_step "Setting up desktop notifications..."
     
-    # Check if notify-send is available
-    if ! command -v notify-send &> /dev/null; then
+    # Check if notification tools are available
+    local notification_tools_available=false
+    
+    if command -v notify-send &> /dev/null; then
+        log_info "notify-send found"
+        notification_tools_available=true
+    fi
+    
+    if command -v kdialog &> /dev/null; then
+        log_info "kdialog found (KDE)"
+        notification_tools_available=true
+    fi
+    
+    if command -v zenity &> /dev/null; then
+        log_info "zenity found"
+        notification_tools_available=true
+    fi
+    
+    # Install notification support if needed
+    if [ "$notification_tools_available" = false ]; then
         log_info "Installing notification support..."
         
         case "$OS_ID" in
             "ubuntu"|"debian"|"linuxmint")
-                apt-get update -qq && apt-get install -y libnotify-bin
+                apt-get update -qq && apt-get install -y libnotify-bin zenity
                 ;;
             "fedora"|"rhel"|"centos")
-                dnf install -y libnotify || yum install -y libnotify
+                dnf install -y libnotify zenity || yum install -y libnotify zenity
                 ;;
             "arch"|"manjaro"|"endeavouros")
-                pacman -S --noconfirm libnotify
+                pacman -S --noconfirm libnotify zenity
                 ;;
             "opensuse"|"suse")
-                zypper install -y libnotify-tools
+                zypper install -y libnotify-tools zenity
                 ;;
             *)
-                log_warn "Unknown distribution. Please install 'notify-send' manually for desktop notifications"
+                log_warn "Unknown distribution. Please install notification tools manually:"
+                log_warn "  - For GNOME/XFCE: libnotify-bin or notify-send"
+                log_warn "  - For KDE: kdialog (usually pre-installed)"
+                log_warn "  - Universal: zenity"
                 ;;
         esac
     fi
     
-    if command -v notify-send &> /dev/null; then
+    # Test notification support
+    if command -v notify-send &> /dev/null || command -v kdialog &> /dev/null || command -v zenity &> /dev/null; then
         log_info "Desktop notifications enabled"
+        
+        # Detect desktop environment for optimal support
+        if [ -n "$KDE_SESSION_VERSION" ] || [ "$XDG_CURRENT_DESKTOP" = "KDE" ]; then
+            log_info "KDE Plasma detected - using kdialog for notifications"
+        elif [ "$XDG_CURRENT_DESKTOP" = "GNOME" ] || [ -n "$GNOME_DESKTOP_SESSION_ID" ]; then
+            log_info "GNOME detected - using notify-send for notifications"
+        elif [ "$XDG_CURRENT_DESKTOP" = "XFCE" ]; then
+            log_info "XFCE detected - using notify-send for notifications"
+        else
+            log_info "Using available notification tools"
+        fi
     else
-        log_warn "Desktop notifications not available (notify-send not found)"
+        log_warn "Desktop notifications not available - manual installation may be required"
     fi
 }
 setup_modules() {
@@ -206,51 +239,103 @@ send_notification() {
         fi
     fi
     
-    # Try to find active user and display
+    # Try multiple methods to find active user and display
     local user_display=""
     local target_user=""
     
-    # Method 1: Check who's logged in with a display
-    for user_info in $(who | grep "(:0)" | head -1); do
-        if [[ "$user_info" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            target_user="$user_info"
-            user_display=":0"
-            break
-        fi
+    # Method 1: Check who's logged in with a display (X11)
+    for line in $(who | grep "([:]0[)]"); do
+        target_user=$(echo "$line" | awk '{print $1}')
+        user_display=":0"
+        break
     done
     
-    # Method 2: Check loginctl sessions
+    # Method 2: Check active sessions via loginctl
     if [ -z "$target_user" ]; then
-        target_user=$(loginctl list-sessions --no-legend | grep "seat0" | head -1 | awk '{print $3}')
+        target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
         user_display=":0"
     fi
     
-    # Method 3: Fallback to first user in /home
+    # Method 3: Check WAYLAND_DISPLAY for Wayland sessions
     if [ -z "$target_user" ]; then
-        target_user=$(ls /home | head -1)
+        for user in $(ls /home 2>/dev/null); do
+            if [ -n "$(pgrep -u "$user" "kwin_wayland\|gnome-shell\|sway")" ]; then
+                target_user="$user"
+                user_display="wayland-0"
+                break
+            fi
+        done
+    fi
+    
+    # Method 4: Fallback to first user with active X session
+    if [ -z "$target_user" ]; then
+        for user in $(ls /home 2>/dev/null); do
+            if [ -n "$(pgrep -u "$user" Xorg)" ]; then
+                target_user="$user"
+                user_display=":0"
+                break
+            fi
+        done
+    fi
+    
+    # Method 5: Ultimate fallback - first user in /home
+    if [ -z "$target_user" ]; then
+        target_user=$(ls /home 2>/dev/null | head -1)
         user_display=":0"
     fi
     
-    if [ -n "$target_user" ] && [ -n "$user_display" ]; then
-        # Send notification as the target user
-        sudo -u "$target_user" DISPLAY="$user_display" notify-send \
-            --urgency="$urgency" \
-            --icon="$icon" \
-            --app-name="HP Thermal Control" \
-            "$title" \
-            "$message" 2>/dev/null || {
-            # Fallback: try zenity
-            sudo -u "$target_user" DISPLAY="$user_display" zenity --warning \
-                --title="$title" \
-                --text="$message" \
-                --timeout=10 2>/dev/null || true
-        }
+    if [ -n "$target_user" ]; then
+        local notification_sent=false
         
-        # Update cooldown
-        echo "$(date +%s)" > "$cooldown_file"
-        log_msg "NOTIF" "Sent notification to $target_user: $title"
+        # Try KDE notifications first (kdialog)
+        if command -v kdialog &> /dev/null; then
+            sudo -u "$target_user" DISPLAY="$user_display" kdialog \
+                --title "HP Thermal Control" \
+                --passivepopup "$title\n\n$message" 8 2>/dev/null && notification_sent=true
+        fi
+        
+        # Try notify-send if kdialog failed
+        if [ "$notification_sent" = false ] && command -v notify-send &> /dev/null; then
+            sudo -u "$target_user" DISPLAY="$user_display" \
+                XDG_RUNTIME_DIR="/run/user/$(id -u "$target_user")" \
+                notify-send \
+                --urgency="$urgency" \
+                --icon="$icon" \
+                --app-name="HP Thermal Control" \
+                --expire-time=8000 \
+                "$title" \
+                "$message" 2>/dev/null && notification_sent=true
+        fi
+        
+        # Try zenity as fallback
+        if [ "$notification_sent" = false ] && command -v zenity &> /dev/null; then
+            sudo -u "$target_user" DISPLAY="$user_display" zenity \
+                --notification \
+                --text="$title: $message" \
+                --timeout=8 2>/dev/null && notification_sent=true
+        fi
+        
+        # Try direct KDE notification via dbus
+        if [ "$notification_sent" = false ]; then
+            sudo -u "$target_user" DISPLAY="$user_display" \
+                XDG_RUNTIME_DIR="/run/user/$(id -u "$target_user")" \
+                dbus-send --session --dest=org.freedesktop.Notifications \
+                /org/freedesktop/Notifications \
+                org.freedesktop.Notifications.Notify \
+                string:"HP Thermal Control" uint32:0 string:"$icon" \
+                string:"$title" string:"$message" \
+                array:string: dict:string,variant: int32:8000 2>/dev/null && notification_sent=true
+        fi
+        
+        if [ "$notification_sent" = true ]; then
+            # Update cooldown
+            echo "$(date +%s)" > "$cooldown_file"
+            log_msg "NOTIF" "Sent notification to $target_user: $title"
+        else
+            log_msg "WARN" "Failed to send notification to $target_user"
+        fi
     else
-        log_msg "WARN" "Could not send notification - no active display found"
+        log_msg "WARN" "Could not send notification - no active user found"
     fi
 }
 
@@ -509,8 +594,9 @@ main_loop() {
                 fi
                 ;;
             "cooling_down")
+                # CRITICAL: During cooling down period, ALWAYS keep AUTO mode regardless of temperature!
                 if is_cooling_down_expired; then
-                    # After cooling down period, decide next state based on temperature
+                    # Only after cooling down period ends, decide next state
                     if [ $temp -lt $((TEMP_THRESHOLD - HYSTERESIS)) ]; then
                         log_msg "INFO" "Cooling down completed. Temperature ${temp}°C, switching to silent mode"
                         set_manual
@@ -524,7 +610,12 @@ main_loop() {
                         set_state "$current_state"
                     fi
                 else
-                    # Still in cooling down period, keep AUTO mode and don't switch to silent!
+                    # Still in cooling down period - FORCE AUTO mode and prevent any other changes!
+                    if [ $(read_ec 21) -ne 0 ]; then
+                        log_msg "WARN" "Cooling down period: Forcing AUTO mode (was in manual)"
+                        set_auto
+                    fi
+                    
                     cooling_start_file="/tmp/hp-thermal-cooling-start"
                     if [ -f "$cooling_start_file" ]; then
                         start_time=$(cat "$cooling_start_file")
@@ -532,9 +623,10 @@ main_loop() {
                         elapsed=$((current_time - start_time))
                         remaining=$((COOLING_DOWN_TIME - elapsed))
                         if [ $(($(date +%s) % 30)) -eq 0 ]; then
-                            log_msg "INFO" "Cooling down period: ${remaining}s remaining, keeping AUTO mode"
+                            log_msg "INFO" "Cooling down: ${remaining}s remaining | Temp: ${temp}°C | Keeping AUTO mode"
                         fi
                     fi
+                    
                     # Check if temperature spikes again during cooling down
                     if [ $temp -gt $EMERGENCY_COOLING_TEMP ]; then
                         log_msg "WARN" "Temperature spike during cooling down! Restarting emergency cooling"
@@ -754,21 +846,57 @@ main() {
                     systemctl status hp-thermal --no-pager
                     
                     # Test notification if user is available
-                    if command -v notify-send &> /dev/null; then
-                        read -p "Test desktop notification? (y/N): " -n 1 -r
-                        echo
-                        if [[ $REPLY =~ ^[Yy]$ ]]; then
-                            # Find user for test notification
-                            test_user=$(who | grep "(:0)" | head -1 | awk '{print $1}')
-                            if [ -n "$test_user" ]; then
-                                sudo -u "$test_user" DISPLAY=":0" notify-send \
+                    read -p "Test desktop notification? (y/N): " -n 1 -r
+                    echo
+                    if [[ $REPLY =~ ^[Yy]$ ]]; then
+                        # Find user for test notification
+                        test_user=""
+                        for line in $(who | grep "([:]0[)]"); do
+                            test_user=$(echo "$line" | awk '{print $1}')
+                            break
+                        done
+                        
+                        if [ -z "$test_user" ]; then
+                            test_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
+                        fi
+                        
+                        if [ -z "$test_user" ]; then
+                            test_user=$(ls /home 2>/dev/null | head -1)
+                        fi
+                        
+                        if [ -n "$test_user" ]; then
+                            log_info "Testing notification for user: $test_user"
+                            
+                            # Try KDE first
+                            if command -v kdialog &> /dev/null; then
+                                sudo -u "$test_user" DISPLAY=":0" kdialog \
+                                    --title "HP Thermal Control" \
+                                    --passivepopup "✅ Installation Complete!\n\nHP 250 G8 thermal management is now active.\nYou'll receive notifications for critical temperatures." 5 2>/dev/null && {
+                                    log_info "KDE notification test successful!"
+                                } || {
+                                    log_warn "KDE notification test failed"
+                                }
+                            fi
+                            
+                            # Try notify-send as fallback
+                            if command -v notify-send &> /dev/null; then
+                                sudo -u "$test_user" DISPLAY=":0" \
+                                    XDG_RUNTIME_DIR="/run/user/$(id -u "$test_user")" \
+                                    notify-send \
                                     --urgency="normal" \
                                     --icon="dialog-information" \
                                     --app-name="HP Thermal Control" \
+                                    --expire-time=5000 \
                                     "✅ Installation Complete!" \
                                     "HP 250 G8 thermal management is now active.\nYou'll receive notifications for critical temperatures." \
-                                    2>/dev/null || log_warn "Test notification failed"
+                                    2>/dev/null && {
+                                    log_info "notify-send test successful!"
+                                } || {
+                                    log_warn "notify-send test failed"
+                                }
                             fi
+                        else
+                            log_warn "No active user found for notification test"
                         fi
                     fi
                 fi
