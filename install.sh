@@ -294,7 +294,7 @@ send_notification() {
     local cooldown_key=$5
     local cooldown_time=${6:-300}  # 5 minutes default cooldown
     
-    log_msg "INFO" "ATTEMPTING NOTIFICATION: $title (temp check: $cooldown_key)"
+    log_msg "INFO" "🔔 NOTIFICATION REQUEST: '$title' (key: $cooldown_key)"
     
     # Check cooldown to avoid spam
     local cooldown_file="${NOTIFICATION_COOLDOWN_FILE}-${cooldown_key}"
@@ -303,10 +303,14 @@ send_notification() {
         local current_time=$(date +%s)
         local elapsed=$((current_time - last_notif))
         if [ $elapsed -lt $cooldown_time ]; then
-            log_msg "DEBUG" "Notification skipped (cooldown: ${elapsed}/${cooldown_time}s)"
+            log_msg "INFO" "⏰ Notification skipped (cooldown: ${elapsed}/${cooldown_time}s)"
             return 0  # Skip notification (still in cooldown)
         fi
     fi
+    
+    # Log current environment
+    log_msg "INFO" "🔍 Current environment: USER=$(whoami), PWD=$PWD"
+    log_msg "INFO" "🔍 Environment vars: DISPLAY='$DISPLAY', XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
     
     # Try to use saved user info first
     local target_user=""
@@ -318,18 +322,24 @@ send_notification() {
         target_user="$USER"
         user_display="$DISPLAY"
         user_uid="$UID"
-        log_msg "INFO" "Using saved user info: $target_user (uid: $user_uid)"
+        log_msg "INFO" "📁 Using saved user info: $target_user (uid: $user_uid, display: $user_display)"
     fi
     
     # If no saved info or saved info is invalid, detect user again
     if [ -z "$target_user" ] || ! id "$target_user" >/dev/null 2>&1; then
-        log_msg "INFO" "Detecting user info dynamically..."
+        log_msg "INFO" "🔍 Detecting user info dynamically..."
+        
+        # Log all available methods
+        log_msg "INFO" "🔍 WHO output: $(who)"
+        log_msg "INFO" "🔍 LOGINCTL sessions: $(loginctl list-sessions --no-legend 2>/dev/null || echo 'loginctl failed')"
+        log_msg "INFO" "🔍 Users in /home: $(ls /home 2>/dev/null || echo 'no /home')"
+        log_msg "INFO" "🔍 Runtime dirs: $(ls /run/user/ 2>/dev/null || echo 'no runtime dirs')"
         
         # Method 1: Check who's logged in with a display (X11)
         for line in $(who | grep "([:]0[)]"); do
             target_user=$(echo "$line" | awk '{print $1}')
             user_display=":0"
-            log_msg "INFO" "Found user via who: $target_user"
+            log_msg "INFO" "✅ Found user via who: $target_user"
             break
         done
         
@@ -337,16 +347,17 @@ send_notification() {
         if [ -z "$target_user" ]; then
             target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
             user_display=":0"
-            [ -n "$target_user" ] && log_msg "INFO" "Found user via loginctl: $target_user"
+            [ -n "$target_user" ] && log_msg "INFO" "✅ Found user via loginctl: $target_user"
         fi
         
         # Method 3: Check processes for desktop environments
         if [ -z "$target_user" ]; then
             for user in $(ls /home 2>/dev/null); do
-                if [ -n "$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel")" ]; then
+                local processes=$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel" 2>/dev/null)
+                if [ -n "$processes" ]; then
                     target_user="$user"
                     user_display=":0"
-                    log_msg "INFO" "Found user via desktop processes: $target_user"
+                    log_msg "INFO" "✅ Found user via desktop processes: $target_user (processes: $processes)"
                     break
                 fi
             done
@@ -357,11 +368,12 @@ send_notification() {
             for runtime_dir in /run/user/*/; do
                 if [ -d "$runtime_dir" ]; then
                     local uid=$(basename "$runtime_dir")
-                    target_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-                    if [ -n "$target_user" ] && [ "$target_user" != "root" ] && [ "$uid" -ge 1000 ]; then
+                    local temp_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+                    if [ -n "$temp_user" ] && [ "$temp_user" != "root" ] && [ "$uid" -ge 1000 ]; then
+                        target_user="$temp_user"
                         user_display=":0"
                         user_uid="$uid"
-                        log_msg "INFO" "Found user via runtime dir: $target_user (uid: $uid)"
+                        log_msg "INFO" "✅ Found user via runtime dir: $target_user (uid: $uid)"
                         break
                     fi
                 fi
@@ -374,12 +386,73 @@ send_notification() {
     fi
     
     if [ -n "$target_user" ] && [ -n "$user_uid" ]; then
-        log_msg "INFO" "SENDING NOTIFICATION to $target_user (uid: $user_uid, display: $user_display)"
+        log_msg "INFO" "🎯 TARGET USER: $target_user (uid: $user_uid, display: $user_display)"
+        
+        # Check if user really exists and has home directory
+        if [ ! -d "/home/$target_user" ]; then
+            log_msg "ERROR" "❌ User home directory not found: /home/$target_user"
+            return 1
+        fi
+        
+        # Check if runtime directory exists
+        if [ ! -d "/run/user/$user_uid" ]; then
+            log_msg "ERROR" "❌ User runtime directory not found: /run/user/$user_uid"
+            return 1
+        fi
+        
+        # Check if display is accessible
+        log_msg "INFO" "🔍 Testing display access for $target_user..."
+        sudo -u "$target_user" DISPLAY="$user_display" xset q >/dev/null 2>&1 && {
+            log_msg "INFO" "✅ Display access OK"
+        } || {
+            log_msg "WARN" "⚠️  Display access failed, trying anyway..."
+        }
+        
         local notification_sent=false
         
-        # Try KDE notifications first (kdialog)
-        if command -v kdialog &> /dev/null; then
-            log_msg "INFO" "Trying kdialog notification..."
+        # Try direct script approach first (bypass systemd isolation)
+        log_msg "INFO" "🚀 Trying direct script notification method..."
+        cat > /tmp/hp-thermal-notify.sh << EOF
+#!/bin/bash
+export USER="$target_user"
+export HOME="/home/$target_user"
+export DISPLAY="$user_display"
+export XDG_RUNTIME_DIR="/run/user/$user_uid"
+
+# Try kdialog first
+if command -v kdialog &> /dev/null; then
+    kdialog --title "HP Thermal Control" --passivepopup "$title\\n\\n$message" 10 2>/dev/null && exit 0
+fi
+
+# Try notify-send
+if command -v notify-send &> /dev/null; then
+    notify-send --urgency="$urgency" --icon="$icon" --app-name="HP Thermal Control" --expire-time=10000 "$title" "$message" 2>/dev/null && exit 0
+fi
+
+# Try dbus directly
+if command -v dbus-send &> /dev/null; then
+    dbus-send --session --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:"HP Thermal Control" uint32:0 string:"$icon" string:"$title" string:"$message" array:string: dict:string,variant: int32:10000 2>/dev/null && exit 0
+fi
+
+exit 1
+EOF
+        
+        chmod +x /tmp/hp-thermal-notify.sh
+        
+        # Execute as target user
+        sudo -u "$target_user" /tmp/hp-thermal-notify.sh && {
+            notification_sent=true
+            log_msg "INFO" "✅ Direct script notification SUCCESS"
+        } || {
+            log_msg "WARN" "❌ Direct script notification FAILED"
+        }
+        
+        # Remove temporary script
+        rm -f /tmp/hp-thermal-notify.sh
+        
+        # Try KDE notifications (original method)
+        if [ "$notification_sent" = false ] && command -v kdialog &> /dev/null; then
+            log_msg "INFO" "🔄 Trying kdialog notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
                 HOME="/home/$target_user" \
@@ -394,7 +467,7 @@ send_notification() {
         
         # Try notify-send if kdialog failed
         if [ "$notification_sent" = false ] && command -v notify-send &> /dev/null; then
-            log_msg "INFO" "Trying notify-send notification..."
+            log_msg "INFO" "🔄 Trying notify-send notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
                 HOME="/home/$target_user" \
@@ -412,51 +485,19 @@ send_notification() {
             }
         fi
         
-        # Try direct KDE notification via dbus
-        if [ "$notification_sent" = false ]; then
-            log_msg "INFO" "Trying dbus notification..."
-            sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$user_uid" \
-                HOME="/home/$target_user" \
-                dbus-send --session --dest=org.freedesktop.Notifications \
-                /org/freedesktop/Notifications \
-                org.freedesktop.Notifications.Notify \
-                string:"HP Thermal Control" uint32:0 string:"$icon" \
-                string:"$title" string:"$message" \
-                array:string: dict:string,variant: int32:10000 2>/dev/null && {
-                notification_sent=true
-                log_msg "INFO" "✅ dbus notification SUCCESS"
-            } || {
-                log_msg "WARN" "❌ dbus notification FAILED"
-            }
-        fi
-        
-        # Try zenity as fallback
-        if [ "$notification_sent" = false ] && command -v zenity &> /dev/null; then
-            log_msg "INFO" "Trying zenity notification..."
-            sudo -u "$target_user" DISPLAY="$user_display" \
-                XDG_RUNTIME_DIR="/run/user/$user_uid" \
-                HOME="/home/$target_user" \
-                zenity --notification \
-                --text="$title: $message" \
-                --timeout=10 2>/dev/null && {
-                notification_sent=true
-                log_msg "INFO" "✅ zenity notification SUCCESS"
-            } || {
-                log_msg "WARN" "❌ zenity notification FAILED"
-            }
-        fi
-        
         if [ "$notification_sent" = true ]; then
             # Update cooldown
             echo "$(date +%s)" > "$cooldown_file"
-            log_msg "NOTIF" "🔔 NOTIFICATION SENT to $target_user: $title"
+            log_msg "NOTIF" "🔔 NOTIFICATION DELIVERED to $target_user: $title"
         else
             log_msg "ERROR" "❌ ALL NOTIFICATION METHODS FAILED for user $target_user"
+            log_msg "ERROR" "❌ Debug: Check if $target_user has an active desktop session"
         fi
     else
-        log_msg "ERROR" "❌ NO ACTIVE USER FOUND FOR NOTIFICATIONS"
-        log_msg "ERROR" "Debug info: target_user='$target_user', user_uid='$user_uid', user_display='$user_display'"
+        log_msg "ERROR" "❌ NO VALID USER FOUND FOR NOTIFICATIONS"
+        log_msg "ERROR" "❌ Debug info: target_user='$target_user', user_uid='$user_uid', user_display='$user_display'"
+        log_msg "ERROR" "❌ Available users: $(ls /home 2>/dev/null | tr '\n' ' ')"
+        log_msg "ERROR" "❌ Active sessions: $(who | tr '\n' ' ')"
     fi
 }
 
