@@ -271,6 +271,8 @@ read_ec() {
     fi
 }
 
+# Замените функцию write_ec в /usr/local/bin/hp-thermal-service.sh
+
 write_ec() {
     local addr="$1"
     local value="$2"
@@ -301,7 +303,20 @@ write_ec() {
         return 1
     fi
     
-    if echo -n -e "$(printf '\x%02x' $value)" | dd of="$ECIO" bs=1 seek=$addr count=1 conv=notrunc 2>/dev/null; then
+    # ИСПРАВЛЕНИЕ: Безопасное форматирование hex значения
+    local hex_value
+    if ! hex_value=$(printf '\\x%02x' "$value" 2>/dev/null); then
+        log_msg "ERROR" "write_ec: failed to format hex value for $value"
+        return 1
+    fi
+    
+    # Проверяем что hex_value не пустой
+    if [ -z "$hex_value" ]; then
+        log_msg "ERROR" "write_ec: empty hex value generated for $value"
+        return 1
+    fi
+    
+    if echo -n -e "$hex_value" | dd of="$ECIO" bs=1 seek="$addr" count=1 conv=notrunc 2>/dev/null; then
         log_msg "DEBUG" "Successfully wrote value $value to EC address $addr"
         return 0
     else
@@ -309,7 +324,6 @@ write_ec() {
         return 1
     fi
 }
-
 # Safe wrapper functions with validation
 set_manual() { 
     log_msg "DEBUG" "Setting EC to manual mode"
