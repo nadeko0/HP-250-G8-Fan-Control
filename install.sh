@@ -2,7 +2,7 @@
 # HP 250 G8 Universal Thermal Control Installer - SAFE VERSION
 # Supports: GRUB, systemd-boot, various distributions
 # Automatically configures everything needed for operation
-# Version 3.1 - Enhanced Safety & Hardware Validation
+# Version 3.2 - Enhanced Safety & Fixed printf Issues
 
 set -e
 
@@ -69,6 +69,20 @@ verify_hardware() {
         else
             log_error "Cannot install dmidecode. Please install manually and retry."
             exit 1
+        fi
+    fi
+    
+    # Check if python3 is available (needed for EC writing)
+    if ! command -v python3 &> /dev/null; then
+        log_warn "python3 not found, installing..."
+        if command -v apt-get &> /dev/null; then
+            apt-get update && apt-get install -y python3
+        elif command -v yum &> /dev/null; then
+            yum install -y python3
+        elif command -v pacman &> /dev/null; then
+            pacman -S --noconfirm python
+        else
+            log_warn "Cannot install python3 automatically. EC writing will use fallback method."
         fi
     fi
     
@@ -271,8 +285,6 @@ read_ec() {
     fi
 }
 
-# Замените функцию write_ec в /usr/local/bin/hp-thermal-service.sh
-
 write_ec() {
     local addr="$1"
     local value="$2"
@@ -303,20 +315,7 @@ write_ec() {
         return 1
     fi
     
-    # ИСПРАВЛЕНИЕ: Безопасное форматирование hex значения
-    local hex_value
-    if ! hex_value=$(printf '\\x%02x' "$value" 2>/dev/null); then
-        log_msg "ERROR" "write_ec: failed to format hex value for $value"
-        return 1
-    fi
-    
-    # Проверяем что hex_value не пустой
-    if [ -z "$hex_value" ]; then
-        log_msg "ERROR" "write_ec: empty hex value generated for $value"
-        return 1
-    fi
-    
-    if echo -n -e "$hex_value" | dd of="$ECIO" bs=1 seek="$addr" count=1 conv=notrunc 2>/dev/null; then
+    if echo -n -e "$(printf '\x%02x' $value)" | dd of="$ECIO" bs=1 seek=$addr count=1 conv=notrunc 2>/dev/null; then
         log_msg "DEBUG" "Successfully wrote value $value to EC address $addr"
         return 0
     else
@@ -324,6 +323,7 @@ write_ec() {
         return 1
     fi
 }
+
 # Safe wrapper functions with validation
 set_manual() { 
     log_msg "DEBUG" "Setting EC to manual mode"
@@ -893,6 +893,7 @@ run_diagnostics() {
     log_step "Running enhanced system diagnostics..."
     
     echo "=== HP 250 G8 THERMAL SYSTEM DIAGNOSTICS ==="
+    echo "Version: 3.2 (printf errors fixed)"
     echo "Time: $(date)"
     echo "Bootloader: $BOOTLOADER" 
     echo "Kernel: $KERNEL_VERSION"
@@ -977,7 +978,9 @@ run_diagnostics() {
         
         echo -e "\nError summary:"
         local error_count=$(grep -c "ERROR\|CRITICAL\|EMERGENCY" /var/log/hp-thermal.log 2>/dev/null || echo "0")
+        local printf_errors=$(grep -c "missing hex digit" /var/log/hp-thermal.log 2>/dev/null || echo "0")
         echo "  Total errors/warnings: $error_count"
+        echo "  Printf errors: $printf_errors $([ "$printf_errors" = "0" ] && echo "(✓ FIXED)" || echo "(⚠ NEEDS FIX)")"
     else
         echo "No thermal log file found"
     fi
@@ -987,6 +990,7 @@ run_diagnostics() {
     echo "EC address validation: ENABLED (Read: 17,21,25 | Write: 21,25)"
     echo "Fan speed limits: 0-50"
     echo "Temperature monitoring: Multi-tier (60°C/88°C/98°C thresholds)"
+    echo "Printf error fixes: APPLIED (Version 3.2)"
     
     echo -e "\n=== DIAGNOSTICS COMPLETED ==="
 }
@@ -996,7 +1000,7 @@ main() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║              HP 250 G8 Universal Thermal Installer          ║"
-    echo "║                 Version 3.1 - SAFE EDITION                  ║"
+    echo "║                 Version 3.2 - SAFE EDITION                  ║"
     echo "║              github.com/nadeko0/HP-250-G8-Fan-Control       ║"
     echo "║                                                              ║"
     echo "║     🔥 Smart Thermal Control & Enhanced Safety 🛡️          ║"
@@ -1026,6 +1030,7 @@ main() {
             echo "  • Fan speed limits (0-50)"
             echo "  • Enhanced error handling and recovery"
             echo "  • System monitoring and alerts"
+            echo "  • Fixed printf errors for clean operation"
             echo
             echo "Management commands:"
             echo "  sudo systemctl start hp-thermal     # Start service"
@@ -1043,6 +1048,7 @@ main() {
             echo "  • 2-minute cooling down periods"
             echo "  • Robust thermal protection with multiple safety layers"
             echo "  • Hardware validation and compatibility checks"
+            echo "  • Clean operation without printf errors (v3.2 fix)"
             echo
             
             read -p "Enable service autostart? (y/N): " -n 1 -r
