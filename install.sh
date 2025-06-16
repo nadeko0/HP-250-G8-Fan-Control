@@ -196,6 +196,7 @@ ECIO=/sys/kernel/debug/ec/ec0/io
 LOG_FILE="/var/log/hp-thermal.log"
 STATE_FILE="/tmp/hp-thermal-state"
 NOTIFICATION_COOLDOWN_FILE="/tmp/hp-thermal-notif-cooldown"
+USER_INFO_FILE="/tmp/hp-thermal-user-info"
 TEMP_THRESHOLD=60
 EMERGENCY_COOLING_TEMP=88
 COOLING_RECOVERY_TEMP=82
@@ -220,6 +221,71 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*" | tee -a "$LOG_FILE"
 }
 
+detect_user_info() {
+    log_msg "INFO" "Detecting active user for notifications..."
+    
+    local target_user=""
+    local user_display=""
+    local user_uid=""
+    
+    # Method 1: Check who's logged in with a display (X11)
+    for line in $(who | grep "([:]0[)]"); do
+        target_user=$(echo "$line" | awk '{print $1}')
+        user_display=":0"
+        log_msg "INFO" "Found user via who: $target_user"
+        break
+    done
+    
+    # Method 2: Check active sessions via loginctl
+    if [ -z "$target_user" ]; then
+        target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
+        user_display=":0"
+        [ -n "$target_user" ] && log_msg "INFO" "Found user via loginctl: $target_user"
+    fi
+    
+    # Method 3: Check processes for desktop environments
+    if [ -z "$target_user" ]; then
+        for user in $(ls /home 2>/dev/null); do
+            if [ -n "$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel")" ]; then
+                target_user="$user"
+                user_display=":0"
+                log_msg "INFO" "Found user via desktop processes: $target_user"
+                break
+            fi
+        done
+    fi
+    
+    # Method 4: Check XDG_RUNTIME_DIR for active sessions
+    if [ -z "$target_user" ]; then
+        for runtime_dir in /run/user/*/; do
+            if [ -d "$runtime_dir" ]; then
+                local uid=$(basename "$runtime_dir")
+                target_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+                if [ -n "$target_user" ] && [ "$target_user" != "root" ] && [ "$uid" -ge 1000 ]; then
+                    user_display=":0"
+                    log_msg "INFO" "Found user via runtime dir: $target_user (uid: $uid)"
+                    break
+                fi
+            fi
+        done
+    fi
+    
+    if [ -n "$target_user" ]; then
+        user_uid=$(id -u "$target_user" 2>/dev/null)
+        if [ -n "$user_uid" ]; then
+            # Save user info for later use
+            echo "USER=$target_user" > "$USER_INFO_FILE"
+            echo "DISPLAY=$user_display" >> "$USER_INFO_FILE"
+            echo "UID=$user_uid" >> "$USER_INFO_FILE"
+            log_msg "INFO" "Saved user info: $target_user (uid: $user_uid, display: $user_display)"
+            return 0
+        fi
+    fi
+    
+    log_msg "WARN" "Could not detect active user for notifications"
+    return 1
+}
+
 send_notification() {
     local urgency=$1
     local title=$2
@@ -228,7 +294,7 @@ send_notification() {
     local cooldown_key=$5
     local cooldown_time=${6:-300}  # 5 minutes default cooldown
     
-    log_msg "DEBUG" "Attempting to send notification: $title (cooldown: ${cooldown_time}s)"
+    log_msg "INFO" "ATTEMPTING NOTIFICATION: $title (temp check: $cooldown_key)"
     
     # Check cooldown to avoid spam
     local cooldown_file="${NOTIFICATION_COOLDOWN_FILE}-${cooldown_key}"
@@ -242,144 +308,155 @@ send_notification() {
         fi
     fi
     
-    # Try multiple methods to find active user and display
-    local user_display=""
+    # Try to use saved user info first
     local target_user=""
+    local user_display=""
+    local user_uid=""
     
-    # Method 1: Check who's logged in with a display (X11)
-    log_msg "DEBUG" "Checking who command for active display..."
-    for line in $(who | grep "([:]0[)]"); do
-        target_user=$(echo "$line" | awk '{print $1}')
-        user_display=":0"
-        log_msg "DEBUG" "Found user via who: $target_user"
-        break
-    done
-    
-    # Method 2: Check active sessions via loginctl
-    if [ -z "$target_user" ]; then
-        log_msg "DEBUG" "Checking loginctl sessions..."
-        target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
-        user_display=":0"
-        [ -n "$target_user" ] && log_msg "DEBUG" "Found user via loginctl: $target_user"
+    if [ -f "$USER_INFO_FILE" ]; then
+        source "$USER_INFO_FILE" 2>/dev/null
+        target_user="$USER"
+        user_display="$DISPLAY"
+        user_uid="$UID"
+        log_msg "INFO" "Using saved user info: $target_user (uid: $user_uid)"
     fi
     
-    # Method 3: Check processes for desktop environments
-    if [ -z "$target_user" ]; then
-        log_msg "DEBUG" "Checking desktop environment processes..."
-        for user in $(ls /home 2>/dev/null); do
-            if [ -n "$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel")" ]; then
-                target_user="$user"
-                user_display=":0"
-                log_msg "DEBUG" "Found user via desktop processes: $target_user"
-                break
-            fi
+    # If no saved info or saved info is invalid, detect user again
+    if [ -z "$target_user" ] || ! id "$target_user" >/dev/null 2>&1; then
+        log_msg "INFO" "Detecting user info dynamically..."
+        
+        # Method 1: Check who's logged in with a display (X11)
+        for line in $(who | grep "([:]0[)]"); do
+            target_user=$(echo "$line" | awk '{print $1}')
+            user_display=":0"
+            log_msg "INFO" "Found user via who: $target_user"
+            break
         done
-    fi
-    
-    # Method 4: Check XDG_RUNTIME_DIR for active sessions
-    if [ -z "$target_user" ]; then
-        log_msg "DEBUG" "Checking runtime directories..."
-        for runtime_dir in /run/user/*/; do
-            if [ -d "$runtime_dir" ]; then
-                local uid=$(basename "$runtime_dir")
-                target_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-                if [ -n "$target_user" ] && [ "$target_user" != "root" ]; then
+        
+        # Method 2: Check active sessions via loginctl
+        if [ -z "$target_user" ]; then
+            target_user=$(loginctl list-sessions --no-legend 2>/dev/null | grep "seat0" | head -1 | awk '{print $3}')
+            user_display=":0"
+            [ -n "$target_user" ] && log_msg "INFO" "Found user via loginctl: $target_user"
+        fi
+        
+        # Method 3: Check processes for desktop environments
+        if [ -z "$target_user" ]; then
+            for user in $(ls /home 2>/dev/null); do
+                if [ -n "$(pgrep -u "$user" "plasmashell\|kwin\|gnome-shell\|xfce4-panel")" ]; then
+                    target_user="$user"
                     user_display=":0"
-                    log_msg "DEBUG" "Found user via runtime dir: $target_user (uid: $uid)"
+                    log_msg "INFO" "Found user via desktop processes: $target_user"
                     break
                 fi
-            fi
-        done
-    fi
-    
-    # Method 5: Ultimate fallback - first user in /home
-    if [ -z "$target_user" ]; then
-        target_user=$(ls /home 2>/dev/null | head -1)
-        user_display=":0"
-        [ -n "$target_user" ] && log_msg "DEBUG" "Found user via fallback: $target_user"
-    fi
-    
-    if [ -n "$target_user" ]; then
-        local notification_sent=false
-        local user_uid=$(id -u "$target_user" 2>/dev/null)
+            done
+        fi
         
-        log_msg "DEBUG" "Attempting to send notification to user: $target_user (uid: $user_uid)"
+        # Method 4: Check XDG_RUNTIME_DIR for active sessions
+        if [ -z "$target_user" ]; then
+            for runtime_dir in /run/user/*/; do
+                if [ -d "$runtime_dir" ]; then
+                    local uid=$(basename "$runtime_dir")
+                    target_user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+                    if [ -n "$target_user" ] && [ "$target_user" != "root" ] && [ "$uid" -ge 1000 ]; then
+                        user_display=":0"
+                        user_uid="$uid"
+                        log_msg "INFO" "Found user via runtime dir: $target_user (uid: $uid)"
+                        break
+                    fi
+                fi
+            done
+        fi
+        
+        if [ -n "$target_user" ] && [ -z "$user_uid" ]; then
+            user_uid=$(id -u "$target_user" 2>/dev/null)
+        fi
+    fi
+    
+    if [ -n "$target_user" ] && [ -n "$user_uid" ]; then
+        log_msg "INFO" "SENDING NOTIFICATION to $target_user (uid: $user_uid, display: $user_display)"
+        local notification_sent=false
         
         # Try KDE notifications first (kdialog)
         if command -v kdialog &> /dev/null; then
-            log_msg "DEBUG" "Trying kdialog notification..."
+            log_msg "INFO" "Trying kdialog notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                HOME="/home/$target_user" \
                 kdialog --title "HP Thermal Control" \
-                --passivepopup "$title\n\n$message" 8 2>/dev/null && {
+                --passivepopup "$title\n\n$message" 10 2>/dev/null && {
                 notification_sent=true
-                log_msg "DEBUG" "kdialog notification successful"
+                log_msg "INFO" "✅ kdialog notification SUCCESS"
             } || {
-                log_msg "DEBUG" "kdialog notification failed"
+                log_msg "WARN" "❌ kdialog notification FAILED"
             }
         fi
         
         # Try notify-send if kdialog failed
         if [ "$notification_sent" = false ] && command -v notify-send &> /dev/null; then
-            log_msg "DEBUG" "Trying notify-send notification..."
+            log_msg "INFO" "Trying notify-send notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                HOME="/home/$target_user" \
                 notify-send \
                 --urgency="$urgency" \
                 --icon="$icon" \
                 --app-name="HP Thermal Control" \
-                --expire-time=8000 \
+                --expire-time=10000 \
                 "$title" \
                 "$message" 2>/dev/null && {
                 notification_sent=true
-                log_msg "DEBUG" "notify-send notification successful"
+                log_msg "INFO" "✅ notify-send notification SUCCESS"
             } || {
-                log_msg "DEBUG" "notify-send notification failed"
+                log_msg "WARN" "❌ notify-send notification FAILED"
             }
         fi
         
         # Try direct KDE notification via dbus
         if [ "$notification_sent" = false ]; then
-            log_msg "DEBUG" "Trying dbus notification..."
+            log_msg "INFO" "Trying dbus notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                HOME="/home/$target_user" \
                 dbus-send --session --dest=org.freedesktop.Notifications \
                 /org/freedesktop/Notifications \
                 org.freedesktop.Notifications.Notify \
                 string:"HP Thermal Control" uint32:0 string:"$icon" \
                 string:"$title" string:"$message" \
-                array:string: dict:string,variant: int32:8000 2>/dev/null && {
+                array:string: dict:string,variant: int32:10000 2>/dev/null && {
                 notification_sent=true
-                log_msg "DEBUG" "dbus notification successful"
+                log_msg "INFO" "✅ dbus notification SUCCESS"
             } || {
-                log_msg "DEBUG" "dbus notification failed"
+                log_msg "WARN" "❌ dbus notification FAILED"
             }
         fi
         
         # Try zenity as fallback
         if [ "$notification_sent" = false ] && command -v zenity &> /dev/null; then
-            log_msg "DEBUG" "Trying zenity notification..."
+            log_msg "INFO" "Trying zenity notification..."
             sudo -u "$target_user" DISPLAY="$user_display" \
                 XDG_RUNTIME_DIR="/run/user/$user_uid" \
+                HOME="/home/$target_user" \
                 zenity --notification \
                 --text="$title: $message" \
-                --timeout=8 2>/dev/null && {
+                --timeout=10 2>/dev/null && {
                 notification_sent=true
-                log_msg "DEBUG" "zenity notification successful"
+                log_msg "INFO" "✅ zenity notification SUCCESS"
             } || {
-                log_msg "DEBUG" "zenity notification failed"
+                log_msg "WARN" "❌ zenity notification FAILED"
             }
         fi
         
         if [ "$notification_sent" = true ]; then
             # Update cooldown
             echo "$(date +%s)" > "$cooldown_file"
-            log_msg "NOTIF" "Sent notification to $target_user: $title"
+            log_msg "NOTIF" "🔔 NOTIFICATION SENT to $target_user: $title"
         else
-            log_msg "WARN" "Failed to send notification to $target_user - all methods failed"
+            log_msg "ERROR" "❌ ALL NOTIFICATION METHODS FAILED for user $target_user"
         fi
     else
-        log_msg "WARN" "Could not send notification - no active user found"
+        log_msg "ERROR" "❌ NO ACTIVE USER FOUND FOR NOTIFICATIONS"
+        log_msg "ERROR" "Debug info: target_user='$target_user', user_uid='$user_uid', user_display='$user_display'"
     fi
 }
 
@@ -529,12 +606,17 @@ cleanup() {
     rm -f "$STATE_FILE"
     rm -f /tmp/hp-thermal-cooling-start
     rm -f /tmp/hp-thermal-notif-cooldown-*
+    rm -f "$USER_INFO_FILE"
     exit 0
 }
 trap cleanup SIGTERM SIGINT SIGQUIT
 
 main_loop() {
     log_msg "INFO" "HP 250 G8 Thermal Service started (threshold: ${TEMP_THRESHOLD}°C, emergency: ${EMERGENCY_COOLING_TEMP}°C)"
+    
+    # Detect user for notifications at startup
+    detect_user_info
+    
     current_state=$(get_state)
     error_count=0
     overheat_protection_count=0
@@ -591,13 +673,17 @@ main_loop() {
         
         # Additional temperature alerts (independent of state machine)
         if [ $temp -gt 95 ] && [ "$current_state" != "cooling_down" ]; then
-            log_msg "ALERT" "High temperature detected: ${temp}°C"
+            log_msg "ALERT" "🔥 HIGH TEMPERATURE DETECTED: ${temp}°C - FORCING NOTIFICATION"
+            
+            # FORCE notification by removing cooldown temporarily
+            rm -f "${NOTIFICATION_COOLDOWN_FILE}-high_temp_alert" 2>/dev/null
+            
             send_notification "critical" \
                 "🌡️ High Temperature Warning" \
                 "CPU temperature: ${temp}°C\nThermal management active." \
                 "dialog-warning" \
                 "high_temp_alert" \
-                120  # 2 minute cooldown for temperature alerts
+                60  # 1 minute cooldown for temperature alerts
         fi
         
         if [ $temp -gt $CRITICAL_EMERGENCY_TEMP ]; then
@@ -714,7 +800,7 @@ main_loop() {
 
 case "$1" in
     "start") main_loop ;;
-    "stop") emergency_auto; rm -f "$STATE_FILE"; rm -f /tmp/hp-thermal-cooling-start; rm -f /tmp/hp-thermal-notif-cooldown-*; log_msg "INFO" "Service stopped" ;;
+    "stop") emergency_auto; rm -f "$STATE_FILE"; rm -f /tmp/hp-thermal-cooling-start; rm -f /tmp/hp-thermal-notif-cooldown-*; rm -f "$USER_INFO_FILE"; log_msg "INFO" "Service stopped" ;;
     "status")
         temp=$(get_temperature)
         mode=$(read_ec 21)
@@ -760,6 +846,13 @@ case "$1" in
     "test-notification")
         log_msg "INFO" "Testing desktop notification..."
         temp=$(get_temperature)
+        
+        # Force detect user info
+        detect_user_info
+        
+        # Remove any cooldowns for test
+        rm -f /tmp/hp-thermal-notif-cooldown-* 2>/dev/null
+        
         send_notification "normal" \
             "🧪 HP Thermal Test" \
             "Test notification from HP Thermal Control\nCurrent temperature: ${temp}°C" \
@@ -986,6 +1079,7 @@ main() {
             rm -f /tmp/hp-thermal-state
             rm -f /tmp/hp-thermal-cooling-start
             rm -f /tmp/hp-thermal-notif-cooldown-*
+            rm -f "$USER_INFO_FILE"
             
             systemctl daemon-reload
             udevadm control --reload-rules
