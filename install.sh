@@ -414,12 +414,12 @@ case "$1" in
         echo "Threshold: ${TEMP_THRESHOLD}°C"
         
         # Check cooling down status
-        local cooling_start_file="/tmp/hp-thermal-cooling-start"
+        cooling_start_file="/tmp/hp-thermal-cooling-start"
         if [ -f "$cooling_start_file" ]; then
-            local start_time=$(cat "$cooling_start_file")
-            local current_time=$(date +%s)
-            local elapsed=$((current_time - start_time))
-            local remaining=$((COOLING_DOWN_TIME - elapsed))
+            start_time=$(cat "$cooling_start_file")
+            current_time=$(date +%s)
+            elapsed=$((current_time - start_time))
+            remaining=$((COOLING_DOWN_TIME - elapsed))
             if [ $remaining -gt 0 ]; then
                 echo "Cooling Down: ${remaining}s remaining"
             fi
